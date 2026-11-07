@@ -222,6 +222,44 @@ internal static class Motion
     }
 }
 
+// Janela secundária com o mesmo fundo borrado da janela principal.
+internal class GlassForm : Form, IGlassSurface
+{
+    private Bitmap backdrop;
+    private readonly bool dark;
+
+    public GlassForm(bool darkTheme)
+    {
+        dark = darkTheme;
+        DoubleBuffered = true;
+        BackColor = dark ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
+    }
+
+    public void PaintGlass(Graphics graphics)
+    {
+        int width = Math.Max(1, ClientSize.Width);
+        int height = Math.Max(1, ClientSize.Height);
+        if (backdrop == null || backdrop.Width != width || backdrop.Height < height)
+        {
+            Bitmap fresh = Glass.CreateBackdrop(width, Math.Max(800, height) + 200, dark);
+            if (backdrop != null) backdrop.Dispose();
+            backdrop = fresh;
+        }
+        Glass.DrawBackdrop(graphics, backdrop, BackColor);
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        PaintGlass(e.Graphics);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && backdrop != null) { backdrop.Dispose(); backdrop = null; }
+        base.Dispose(disposing);
+    }
+}
+
 // Um controle que sabe pintar o próprio fundo (vidro) para os filhos translúcidos que estão por cima dele.
 internal interface IGlassSurface
 {
@@ -304,6 +342,20 @@ internal static class Glass
             }
         }
         return result;
+    }
+
+    // Desenha só a parte visível do fundo (rápido, mesmo com muitos controles translúcidos).
+    public static void DrawBackdrop(Graphics graphics, Bitmap image, Color fallback)
+    {
+        RectangleF clip = graphics.VisibleClipBounds;
+        Rectangle area = Rectangle.Intersect(
+            new Rectangle((int)Math.Floor(clip.X) - 1, (int)Math.Floor(clip.Y) - 1, (int)Math.Ceiling(clip.Width) + 3, (int)Math.Ceiling(clip.Height) + 3),
+            new Rectangle(0, 0, image.Width, image.Height));
+        if (area.Width <= 0 || area.Height <= 0) { graphics.Clear(fallback); return; }
+        InterpolationMode interpolation = graphics.InterpolationMode;
+        graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+        graphics.DrawImage(image, area, area, GraphicsUnit.Pixel);
+        graphics.InterpolationMode = interpolation;
     }
 
     private static void DrawBlob(Graphics g, float cx, float cy, float radius, Color color)
@@ -514,6 +566,7 @@ internal sealed class RoundedButton : Control
         base.OnVisibleChanged(e);
     }
     protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
 
     private static Color Blend(Color foreground, Color background, double amount)
     {
@@ -534,9 +587,13 @@ internal sealed class RoundedThumbnail : Control
     }
     public Color PlaceholderColor { get; set; }
     public Color PlaceholderTextColor { get; set; }
+    public string PlaceholderText { get; set; }
+    public float PlaceholderFontSize { get; set; }
 
     public RoundedThumbnail()
     {
+        PlaceholderText = "YT";
+        PlaceholderFontSize = 17F;
         PlaceholderColor = Color.FromArgb(55, 55, 55);
         PlaceholderTextColor = Color.Gainsboro;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
@@ -566,10 +623,10 @@ internal sealed class RoundedThumbnail : Control
             }
             else
             {
-                using (Font font = new Font("Segoe UI", 17F, FontStyle.Bold))
+                using (Font font = new Font("Segoe UI", PlaceholderFontSize, FontStyle.Bold))
                 using (SolidBrush textBrush = new SolidBrush(PlaceholderTextColor))
                 using (StringFormat format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                    e.Graphics.DrawString("YT", font, textBrush, bounds, format);
+                    e.Graphics.DrawString(PlaceholderText ?? "", font, textBrush, bounds, format);
             }
         }
         e.Graphics.ResetClip();
@@ -5848,16 +5905,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
     public void PaintGlass(Graphics graphics)
     {
-        Bitmap image = GetBackdrop();
-        RectangleF clip = graphics.VisibleClipBounds;
-        Rectangle area = Rectangle.Intersect(
-            new Rectangle((int)Math.Floor(clip.X) - 1, (int)Math.Floor(clip.Y) - 1, (int)Math.Ceiling(clip.Width) + 3, (int)Math.Ceiling(clip.Height) + 3),
-            new Rectangle(0, 0, image.Width, image.Height));
-        if (area.Width <= 0 || area.Height <= 0) { graphics.Clear(BackColor); return; }
-        InterpolationMode interpolation = graphics.InterpolationMode;
-        graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
-        graphics.DrawImage(image, area, area, GraphicsUnit.Pixel);
-        graphics.InterpolationMode = interpolation;
+        Glass.DrawBackdrop(graphics, GetBackdrop(), BackColor);
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
@@ -6241,12 +6289,77 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     // ===================== Conversor de arquivos (vídeo, áudio e imagem) =====================
 
     private static readonly string[] ConverterImageInputs = new string[] { ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico", ".jfif", ".avif", ".heic" };
-    private static readonly string[] ConverterTargets = new string[]
+    private static readonly string[] ConverterKinds = new string[] { "video", "audio", "image" };
+
+    // Só formatos que fazem sentido para cada tipo de arquivo.
+    private static string[] ConverterTargetsFor(string kind)
     {
-        "MP4 · vídeo", "MKV · vídeo", "MOV · vídeo", "WEBM · vídeo", "AVI · vídeo", "GIF · animação",
-        "MP3 · áudio", "AAC · áudio", "M4A · áudio", "WAV · áudio", "FLAC · áudio", "OGG · áudio", "OPUS · áudio",
-        "PNG · imagem", "JPG · imagem", "WEBP · imagem", "BMP · imagem", "ICO · ícone"
-    };
+        if (kind == "image") return new string[] { "PNG · imagem", "JPG · imagem", "WEBP · imagem", "BMP · imagem", "ICO · ícone" };
+        if (kind == "audio") return new string[] { "MP3 · áudio", "M4A · áudio", "AAC · áudio", "WAV · áudio", "FLAC · áudio", "OGG · áudio", "OPUS · áudio" };
+        return new string[]
+        {
+            "MP4 · vídeo", "MKV · vídeo", "MOV · vídeo", "WEBM · vídeo", "AVI · vídeo", "GIF · animação",
+            "MP3 · só o áudio", "M4A · só o áudio", "AAC · só o áudio", "WAV · só o áudio", "FLAC · só o áudio", "OGG · só o áudio", "OPUS · só o áudio"
+        };
+    }
+
+    private static string ConverterKindLabel(string kind, int count)
+    {
+        string n = count.ToString(CultureInfo.InvariantCulture);
+        if (kind == "image") return "▣  " + (count == 1 ? "1 imagem" : n + " imagens");
+        if (kind == "audio") return "♪  " + (count == 1 ? "1 música/áudio" : n + " músicas/áudios");
+        return "▶  " + (count == 1 ? "1 vídeo" : n + " vídeos");
+    }
+
+    private static string ConverterKindGlyph(string kind)
+    {
+        return kind == "image" ? "IMG" : kind == "audio" ? "♪" : "▶";
+    }
+
+    // Um "vídeo" sem imagem (ex.: .mp4 só com áudio) é tratado como áudio, para mostrar as opções certas.
+    private static string EffectiveKind(ConvertItem item)
+    {
+        if (item.Kind == "video" && item.Probed && item.VideoCodec == null && item.AudioCodec != null) return "audio";
+        return item.Kind;
+    }
+
+    private static string ConvertItemDetails(ConvertItem item)
+    {
+        if (!item.Probed || item.Kind == "image") return "";
+        List<string> parts = new List<string>();
+        if (item.Duration > 0) parts.Add(FormatTime((int)Math.Round(item.Duration)));
+        if (item.VideoCodec != null) parts.Add(item.VideoCodec.ToUpperInvariant());
+        if (item.AudioCodec != null) parts.Add(item.AudioCodec.ToUpperInvariant());
+        return String.Join(" · ", parts.ToArray());
+    }
+
+    // Miniatura para o card do conversor: a própria imagem, um quadro do vídeo ou a capa da música.
+    private Bitmap MakeConvertThumbnail(ConvertItem item)
+    {
+        string kind = EffectiveKind(item);
+        if (kind == "audio" && !item.CoverOnly) return null;
+        string temp = Path.Combine(Path.GetTempPath(), "ytd-thumb-" + Guid.NewGuid().ToString("N") + ".png");
+        try
+        {
+            string input = "-i \"" + item.Path + "\"";
+            string tail = " -an -frames:v 1 -vf \"scale=144:-2\" \"" + temp + "\"";
+            bool ok = kind == "video"
+                ? RunFfmpeg("-ss 1 " + input + tail) || RunFfmpeg(input + tail)
+                : RunFfmpeg(input + tail);
+            if (!ok || !File.Exists(temp)) return null;
+            byte[] bytes = File.ReadAllBytes(temp);
+            using (MemoryStream stream = new MemoryStream(bytes))
+            using (Image image = Image.FromStream(stream))
+                return new Bitmap(image);
+        }
+        catch { return null; }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch { }
+        }
+    }
+
     private static bool? nvencAvailable;
     private static readonly object nvencLock = new object();
 
@@ -6477,7 +6590,6 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
     private void ShowConverter(object sender, EventArgs e)
     {
-        Color background = darkMode ? Color.FromArgb(31, 31, 31) : Color.FromArgb(241, 245, 249);
         Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
         Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
         Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
@@ -6485,8 +6597,13 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         Color accent = Color.FromArgb(16, 185, 129);
         Color accentText = darkMode ? Color.FromArgb(52, 211, 153) : Color.FromArgb(5, 150, 105);
         Color danger = darkMode ? Color.FromArgb(248, 113, 113) : Color.FromArgb(220, 38, 38);
+        // Mesmo vidro da janela principal.
+        Color cardColor = darkMode ? Color.FromArgb(40, 40, 46) : Color.White;
+        int cardAlpha = darkMode ? 165 : 170;
+        int buttonAlpha = darkMode ? 140 : 180;
+        Color glassBorder = darkMode ? Color.FromArgb(40, 255, 255, 255) : Color.FromArgb(120, 148, 163, 184);
 
-        Form dialog = new Form();
+        GlassForm dialog = new GlassForm(darkMode);
         Motion.FadeIn(dialog);
         dialog.Text = "Converter arquivos";
         dialog.StartPosition = FormStartPosition.CenterParent;
@@ -6494,9 +6611,8 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         dialog.MaximizeBox = false;
         dialog.MinimizeBox = false;
         dialog.ShowInTaskbar = false;
-        dialog.ClientSize = new Size(600, 560);
+        dialog.ClientSize = new Size(600, 522);
         dialog.Font = Font;
-        dialog.BackColor = background;
         dialog.ForeColor = mainText;
         dialog.AllowDrop = true;
         ApplyWindowChrome(dialog);
@@ -6505,6 +6621,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         heading.Text = "Converter arquivos";
         heading.Font = new Font("Segoe UI", 16F, FontStyle.Bold);
         heading.AutoSize = true;
+        heading.BackColor = Color.Transparent;
         heading.Location = new Point(22, 18);
         dialog.Controls.Add(heading);
 
@@ -6512,99 +6629,219 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         subtitle.Text = "Vídeos, músicas e imagens · arraste os arquivos para esta janela";
         subtitle.ForeColor = mutedText;
         subtitle.AutoSize = true;
+        subtitle.BackColor = Color.Transparent;
         subtitle.Location = new Point(24, 52);
         dialog.Controls.Add(subtitle);
 
         FlowLayoutPanel list = new FlowLayoutPanel();
-        list.SetBounds(18, 82, 564, 330);
+        list.SetBounds(18, 82, 564, 290);
         list.AutoScroll = true;
         list.FlowDirection = FlowDirection.TopDown;
         list.WrapContents = false;
-        list.BackColor = background;
+        list.BackColor = Color.Transparent;
         list.Padding = new Padding(2);
         list.AllowDrop = true;
+        Glass.EnableDoubleBuffer(list);
+        // Ao rolar, redesenha tudo para o vidro dos cards acompanhar o fundo.
+        list.Scroll += delegate { list.Invalidate(true); };
+        list.MouseWheel += delegate { list.Invalidate(true); };
         dialog.Controls.Add(list);
 
         Label empty = new Label();
         empty.Text = "Arraste vídeos, músicas ou imagens para cá\r\nou clique em + Adicionar arquivos.";
         empty.ForeColor = mutedText;
+        empty.BackColor = Color.Transparent;
         empty.TextAlign = ContentAlignment.MiddleCenter;
-        empty.Size = new Size(536, 280);
+        empty.Size = new Size(536, 260);
         empty.Margin = new Padding(0, 10, 0, 0);
         list.Controls.Add(empty);
 
         RoundedButton addButton = new RoundedButton(10);
         addButton.Text = "+  Adicionar arquivos";
-        addButton.SetBounds(18, 424, 168, 36);
+        addButton.SetBounds(18, 382, 168, 36);
         addButton.BackColor = surface;
         addButton.ForeColor = mainText;
-        addButton.BorderColor = border;
+        addButton.BorderColor = glassBorder;
+        addButton.GlassAlpha = buttonAlpha;
         dialog.Controls.Add(addButton);
 
         RoundedButton clearButton = new RoundedButton(10);
         clearButton.Text = "Limpar lista";
-        clearButton.SetBounds(194, 424, 110, 36);
+        clearButton.SetBounds(194, 382, 110, 36);
         clearButton.BackColor = surface;
         clearButton.ForeColor = mainText;
-        clearButton.BorderColor = border;
+        clearButton.BorderColor = glassBorder;
+        clearButton.GlassAlpha = buttonAlpha;
         dialog.Controls.Add(clearButton);
 
         Label targetLabel = new Label();
-        targetLabel.Text = "Converter para";
+        targetLabel.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
         targetLabel.ForeColor = mainText;
+        targetLabel.BackColor = Color.Transparent;
         targetLabel.AutoSize = true;
-        targetLabel.Location = new Point(330, 412);
+        targetLabel.Location = new Point(22, 432);
         dialog.Controls.Add(targetLabel);
 
-        RoundedPanel targetSurface = new RoundedPanel(10);
-        targetSurface.SetBounds(328, 432, 254, 34);
-        targetSurface.BackColor = surface;
-        targetSurface.BorderColor = border;
-        ComboBox targetBox = new ComboBox();
-        targetBox.DropDownStyle = ComboBoxStyle.DropDownList;
-        targetBox.FlatStyle = FlatStyle.Flat;
-        targetBox.BackColor = surface;
-        targetBox.ForeColor = mainText;
-        targetBox.MaxDropDownItems = 18;
-        targetBox.Items.AddRange(ConverterTargets);
-        targetBox.SetBounds(12, 4, 230, 26);
-        targetSurface.Controls.Add(targetBox);
-        dialog.Controls.Add(targetSurface);
-        string savedTarget;
-        if (ReadSettings().TryGetValue("convert-target", out savedTarget) && targetBox.Items.IndexOf(savedTarget) >= 0)
-            targetBox.SelectedItem = savedTarget;
-        else targetBox.SelectedIndex = 0;
+        // Um seletor por tipo de arquivo presente na lista; cada um só mostra formatos que fazem sentido para aquele tipo.
+        Dictionary<string, string> savedSettings = ReadSettings();
+        string legacyTarget;
+        savedSettings.TryGetValue("convert-target", out legacyTarget);
+        Dictionary<string, ComboBox> targetBoxes = new Dictionary<string, ComboBox>();
+        Dictionary<string, RoundedPanel> targetSurfaces = new Dictionary<string, RoundedPanel>();
+        Dictionary<string, Label> targetNames = new Dictionary<string, Label>();
+        foreach (string kind in ConverterKinds)
+        {
+            Label kindName = new Label();
+            kindName.ForeColor = mainText;
+            kindName.BackColor = Color.Transparent;
+            kindName.TextAlign = ContentAlignment.MiddleLeft;
+            kindName.AutoEllipsis = true;
+            kindName.Visible = false;
+            dialog.Controls.Add(kindName);
+            targetNames[kind] = kindName;
+
+            RoundedPanel targetSurface = new RoundedPanel(10);
+            targetSurface.BackColor = surface;
+            targetSurface.BorderColor = border;
+            targetSurface.Visible = false;
+            ComboBox box = new ComboBox();
+            box.DropDownStyle = ComboBoxStyle.DropDownList;
+            box.FlatStyle = FlatStyle.Flat;
+            box.BackColor = surface;
+            box.ForeColor = mainText;
+            box.MaxDropDownItems = 16;
+            string[] options = ConverterTargetsFor(kind);
+            box.Items.AddRange(options);
+            box.SetBounds(12, 4, 236, 26);
+            targetSurface.Controls.Add(box);
+            dialog.Controls.Add(targetSurface);
+            targetSurfaces[kind] = targetSurface;
+            targetBoxes[kind] = box;
+
+            string saved;
+            if (savedSettings.TryGetValue("convert-target-" + kind, out saved) && box.Items.IndexOf(saved) >= 0) box.SelectedItem = saved;
+            else if (legacyTarget != null && box.Items.IndexOf(legacyTarget) >= 0) box.SelectedItem = legacyTarget;
+            else box.SelectedIndex = 0;
+        }
 
         Label status = new Label();
         status.Text = "Os arquivos convertidos ficam na mesma pasta dos originais.";
         status.ForeColor = mutedText;
+        status.BackColor = Color.Transparent;
         status.AutoEllipsis = true;
-        status.SetBounds(22, 486, 400, 36);
         dialog.Controls.Add(status);
 
         RoundedButton convertButton = new RoundedButton(14);
         convertButton.Text = "Converter";
         convertButton.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-        convertButton.SetBounds(442, 482, 140, 42);
         convertButton.BackColor = accent;
         convertButton.ForeColor = Color.White;
         convertButton.Enabled = false;
         dialog.Controls.Add(convertButton);
 
         List<ConvertItem> items = new List<ConvertItem>();
+        List<Image> thumbnails = new List<Image>();
+        Dictionary<ConvertItem, RoundedThumbnail> itemThumbs = new Dictionary<ConvertItem, RoundedThumbnail>();
+        Dictionary<ConvertItem, Label> itemNotes = new Dictionary<ConvertItem, Label>();
         bool running = false;
         bool closing = false;
         Timer uiTimer = new Timer();
         uiTimer.Interval = 200;
+        object resizeKey = new object();
+        string shownKinds = null;
+        HashSet<string> userPicked = new HashSet<string>();
+        HashSet<string> suggested = new HashSet<string>();
+        bool adjusting = false;
+
+        Func<ConvertItem, string> targetOf = delegate(ConvertItem item)
+        {
+            ComboBox box = targetBoxes[EffectiveKind(item)];
+            return box.SelectedItem == null ? box.Items[0].ToString() : box.SelectedItem.ToString();
+        };
+
+        // Mostra só os seletores dos tipos que estão na lista e ajusta a altura da janela (com animação).
+        Action relayout = delegate
+        {
+            List<string> present = new List<string>();
+            Dictionary<string, int> counts = new Dictionary<string, int>();
+            foreach (ConvertItem item in items)
+            {
+                string kind = EffectiveKind(item);
+                int count;
+                counts.TryGetValue(kind, out count);
+                counts[kind] = count + 1;
+            }
+            foreach (string kind in ConverterKinds) if (counts.ContainsKey(kind)) present.Add(kind);
+            // Quando um tipo aparece pela primeira vez, sugere um formato diferente do que os arquivos já são
+            // (ex.: MP3 não sugere "virar MP3"). Nunca muda o que a pessoa escolheu.
+            foreach (string kind in present)
+            {
+                if (suggested.Contains(kind) || userPicked.Contains(kind)) continue;
+                bool allProbed = true;
+                HashSet<string> sourceExtensions = new HashSet<string>();
+                foreach (ConvertItem item in items)
+                {
+                    if (!item.Probed) allProbed = false;
+                    if (EffectiveKind(item) == kind) sourceExtensions.Add(Path.GetExtension(item.Path).TrimStart('.').ToLowerInvariant());
+                }
+                if (!allProbed) continue;
+                suggested.Add(kind);
+                ComboBox box = targetBoxes[kind];
+                if (box.SelectedItem == null || !sourceExtensions.Contains(TargetExtension(box.SelectedItem.ToString()))) continue;
+                foreach (object option in box.Items)
+                {
+                    string ext = TargetExtension(option.ToString());
+                    if (sourceExtensions.Contains(ext) || (ext == "jpg" && sourceExtensions.Contains("jpeg"))) continue;
+                    adjusting = true;
+                    box.SelectedItem = option;
+                    adjusting = false;
+                    break;
+                }
+            }
+            int y = 456;
+            foreach (string kind in ConverterKinds)
+            {
+                bool show = counts.ContainsKey(kind);
+                targetNames[kind].Visible = show;
+                targetSurfaces[kind].Visible = show;
+                if (!show) continue;
+                targetNames[kind].Text = ConverterKindLabel(kind, counts[kind]);
+                targetNames[kind].SetBounds(22, y, 290, 34);
+                targetSurfaces[kind].SetBounds(322, y, 260, 34);
+                y += 42;
+            }
+            targetLabel.Text = present.Count == 0 ? "Adicione arquivos para ver as opções de conversão." : "Converter para";
+            targetLabel.Font = present.Count == 0 ? new Font("Segoe UI", 9F) : new Font("Segoe UI", 9.5F, FontStyle.Bold);
+            targetLabel.ForeColor = present.Count == 0 ? mutedText : mainText;
+            int bottom = present.Count == 0 ? 456 : y;
+            status.SetBounds(22, bottom + 12, 400, 36);
+            convertButton.SetBounds(442, bottom + 8, 140, 42);
+
+            string signature = String.Join(",", present.ToArray());
+            int targetHeight = bottom + 66;
+            if (signature == shownKinds && dialog.ClientSize.Height == targetHeight) return;
+            shownKinds = signature;
+            int from = dialog.ClientSize.Height;
+            if (!dialog.Visible || from == targetHeight)
+            {
+                dialog.ClientSize = new Size(600, targetHeight);
+                return;
+            }
+            Motion.Run(resizeKey, 240, delegate(double t)
+            {
+                if (!dialog.IsDisposed) dialog.ClientSize = new Size(600, from + (int)Math.Round((targetHeight - from) * t));
+            }, null, Motion.EaseInOutCubic);
+        };
 
         Action refreshCards = delegate
         {
-            string target = targetBox.SelectedItem == null ? ConverterTargets[0] : targetBox.SelectedItem.ToString();
+            relayout();
             int ready = 0;
             foreach (ConvertItem item in items)
             {
                 string line;
                 Color color = mutedText;
+                string target = targetOf(item);
                 if (item.Done && item.Output != null)
                 {
                     line = item.Lossless ? "✓  Pronto · instantâneo, sem perda de qualidade" : "✓  Pronto · " + Path.GetFileName(item.Output);
@@ -6613,18 +6850,35 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 else if (item.Done) { line = "✗  Não deu certo" + (String.IsNullOrEmpty(item.Error) ? "" : " · " + item.Error); color = danger; }
                 else if (item.Running) line = item.Duration > 0 ? "Convertendo… " + ((int)item.Percent).ToString(CultureInfo.InvariantCulture) + "%" : "Convertendo…";
                 else if (!item.Probed) line = "Analisando…";
-                else if (!IsCompatible(item, target)) { line = "Não dá para converter este arquivo para " + TargetExtension(target).ToUpperInvariant(); color = danger; }
-                else { line = "Pronto para converter"; ready++; }
+                else if (!IsCompatible(item, target))
+                {
+                    line = item.VideoCodec == null && item.AudioCodec == null ? "Este arquivo não tem vídeo nem áudio que dê para converter"
+                        : "Não dá para converter este arquivo para " + TargetExtension(target).ToUpperInvariant();
+                    color = danger;
+                }
+                else { line = "Pronto para virar " + TargetExtension(target).ToUpperInvariant(); ready++; }
                 if (item.StatusLabel.Text != line) item.StatusLabel.Text = line;
                 item.StatusLabel.ForeColor = color;
                 item.Bar.Visible = item.Running;
                 item.Bar.Value = (int)item.Percent;
+                Label note;
+                if (itemNotes.TryGetValue(item, out note))
+                {
+                    string details = ConvertItemDetails(item);
+                    if (note.Text != details) note.Text = details;
+                }
+                RoundedThumbnail thumb;
+                if (itemThumbs.TryGetValue(item, out thumb) && thumb.Image == null)
+                {
+                    string glyph = ConverterKindGlyph(EffectiveKind(item));
+                    if (thumb.PlaceholderText != glyph) { thumb.PlaceholderText = glyph; thumb.Invalidate(); }
+                }
             }
             convertButton.Enabled = !running && ready > 0;
             convertButton.Text = running ? "Convertendo…" : (ready > 1 ? "Converter (" + ready.ToString(CultureInfo.InvariantCulture) + ")" : "Converter");
             addButton.Enabled = !running;
             clearButton.Enabled = !running && items.Count > 0;
-            targetBox.Enabled = !running;
+            foreach (ComboBox box in targetBoxes.Values) box.Enabled = !running;
         };
 
         Action<IEnumerable<string>> addFiles = delegate(IEnumerable<string> paths)
@@ -6646,70 +6900,100 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 catch { }
 
                 RoundedPanel card = new RoundedPanel(12);
-                card.SetBounds(0, 0, 532, 64);
+                card.SetBounds(0, 0, 532, 0);
                 card.Margin = new Padding(2, 2, 2, 7);
-                card.BackColor = surface;
-                card.BorderColor = darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240);
+                card.BackColor = cardColor;
+                card.GlassAlpha = cardAlpha;
+                card.BorderColor = glassBorder;
 
-                Label badge = new Label();
-                badge.Text = item.Kind == "image" ? "IMG" : item.Kind == "audio" ? "♪" : "▶";
-                badge.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-                badge.ForeColor = accentText;
-                badge.BackColor = surface;
-                badge.TextAlign = ContentAlignment.MiddleCenter;
-                badge.SetBounds(10, 14, 36, 36);
-                card.Controls.Add(badge);
+                // Miniatura de verdade (imagem, quadro do vídeo ou capa da música); até carregar, mostra um ícone do tipo.
+                RoundedThumbnail thumb = new RoundedThumbnail();
+                thumb.SetBounds(10, 10, 72, 48);
+                thumb.PlaceholderText = ConverterKindGlyph(item.Kind);
+                thumb.PlaceholderFontSize = 12F;
+                thumb.PlaceholderColor = darkMode ? Color.FromArgb(60, 60, 66) : Color.FromArgb(226, 232, 240);
+                thumb.PlaceholderTextColor = accentText;
+                card.Controls.Add(thumb);
+                itemThumbs[item] = thumb;
 
                 Label name = new Label();
                 name.Text = Path.GetFileName(path);
                 name.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
                 name.ForeColor = mainText;
-                name.BackColor = surface;
+                name.BackColor = Color.Transparent;
                 name.AutoEllipsis = true;
-                name.SetBounds(54, 9, 360, 20);
+                name.SetBounds(94, 9, 300, 20);
                 card.Controls.Add(name);
 
                 Label info = new Label();
                 info.Text = Path.GetExtension(path).TrimStart('.').ToUpperInvariant() + "  ·  " + FormatSize(size);
                 info.Font = new Font("Segoe UI", 8.5F);
                 info.ForeColor = mutedText;
-                info.BackColor = surface;
+                info.BackColor = Color.Transparent;
                 info.TextAlign = ContentAlignment.TopRight;
-                info.SetBounds(400, 11, 120, 18);
+                info.SetBounds(396, 11, 124, 18);
                 card.Controls.Add(info);
 
                 Label line = new Label();
                 line.Font = new Font("Segoe UI", 8.5F);
-                line.BackColor = surface;
+                line.BackColor = Color.Transparent;
                 line.AutoEllipsis = true;
-                line.SetBounds(54, 34, 466, 18);
+                line.SetBounds(94, 30, 280, 18);
                 card.Controls.Add(line);
                 item.StatusLabel = line;
 
+                Label note = new Label();
+                note.Font = new Font("Segoe UI", 8F);
+                note.ForeColor = mutedText;
+                note.BackColor = Color.Transparent;
+                note.TextAlign = ContentAlignment.TopRight;
+                note.AutoEllipsis = true;
+                note.SetBounds(376, 31, 144, 18);
+                card.Controls.Add(note);
+                itemNotes[item] = note;
+
                 PercentBar bar = new PercentBar();
-                bar.SetBounds(54, 54, 466, 4);
-                bar.TrackColor = darkMode ? Color.FromArgb(55, 55, 55) : Color.FromArgb(226, 232, 240);
+                bar.SetBounds(94, 54, 426, 4);
+                bar.TrackColor = darkMode ? Color.FromArgb(60, 255, 255, 255) : Color.FromArgb(70, 100, 116, 139);
                 bar.FillColor = accent;
-                bar.BackColor = surface;
                 bar.Visible = false;
                 card.Controls.Add(bar);
                 item.Bar = bar;
 
                 list.Controls.Add(card);
                 items.Add(item);
+                // O card "abre" suavemente na lista.
+                RoundedPanel growing = card;
+                Motion.Run(new object(), 220, delegate(double t)
+                {
+                    if (!growing.IsDisposed) growing.Height = (int)Math.Round(68 * t);
+                }, null);
+
                 ConvertItem probeTarget = item;
                 if (item.Kind == "image") item.Probed = true;
-                else System.Threading.ThreadPool.QueueUserWorkItem(delegate { ProbeMedia(probeTarget); });
-
-                // Sugere um formato coerente com o primeiro arquivo adicionado.
-                if (items.Count == 1)
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
                 {
-                    string current = targetBox.SelectedItem == null ? "" : targetBox.SelectedItem.ToString();
-                    string currentKind = TargetKind(current);
-                    if (item.Kind == "image" && currentKind != "image") targetBox.SelectedItem = "PNG · imagem";
-                    else if (item.Kind == "audio" && currentKind != "audio") targetBox.SelectedItem = "MP3 · áudio";
-                    else if (item.Kind == "video" && currentKind == "image") targetBox.SelectedItem = "MP4 · vídeo";
-                }
+                    if (probeTarget.Kind != "image") ProbeMedia(probeTarget);
+                    if (closing) return;
+                    Bitmap picture = MakeConvertThumbnail(probeTarget);
+                    if (dialog.IsDisposed) { if (picture != null) picture.Dispose(); return; }
+                    try
+                    {
+                        dialog.BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (dialog.IsDisposed || closing) { if (picture != null) picture.Dispose(); return; }
+                            RoundedThumbnail target;
+                            if (picture != null && itemThumbs.TryGetValue(probeTarget, out target) && !target.IsDisposed)
+                            {
+                                thumbnails.Add(picture);
+                                target.Image = picture;
+                            }
+                            else if (picture != null) picture.Dispose();
+                            refreshCards();
+                        });
+                    }
+                    catch { if (picture != null) picture.Dispose(); }
+                });
             }
             refreshCards();
         };
@@ -6748,20 +7032,39 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 if (old != empty) old.Dispose();
             }
             list.Controls.Add(empty);
+            itemThumbs.Clear();
+            itemNotes.Clear();
+            suggested.Clear();
+            foreach (Image picture in thumbnails) picture.Dispose();
+            thumbnails.Clear();
             status.Text = "Os arquivos convertidos ficam na mesma pasta dos originais.";
             refreshCards();
         };
-        targetBox.SelectedIndexChanged += delegate { refreshCards(); };
+        foreach (KeyValuePair<string, ComboBox> pair in targetBoxes)
+        {
+            string kind = pair.Key;
+            pair.Value.SelectedIndexChanged += delegate
+            {
+                if (adjusting) return;
+                userPicked.Add(kind);
+                refreshCards();
+            };
+        }
 
         convertButton.Click += delegate
         {
-            string target = targetBox.SelectedItem.ToString();
             Dictionary<string, string> settings = ReadSettings();
-            settings["convert-target"] = target;
+            foreach (KeyValuePair<string, ComboBox> pair in targetBoxes)
+                if (pair.Value.SelectedItem != null) settings["convert-target-" + pair.Key] = pair.Value.SelectedItem.ToString();
             WriteSettings(settings);
+            // Cada arquivo usa o formato escolhido para o tipo dele.
+            Dictionary<ConvertItem, string> targets = new Dictionary<ConvertItem, string>();
             List<ConvertItem> work = new List<ConvertItem>();
             foreach (ConvertItem item in items)
-                if (!item.Done && !item.Running && item.Probed && IsCompatible(item, target)) work.Add(item);
+            {
+                string target = targetOf(item);
+                if (!item.Done && !item.Running && item.Probed && IsCompatible(item, target)) { work.Add(item); targets[item] = target; }
+            }
             if (work.Count == 0) return;
             running = true;
             DateTime started = DateTime.Now;
@@ -6776,7 +7079,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                     if (closing) return;
                     item.Running = true;
                     bool ok = false;
-                    try { ok = RunConvert(item, target); }
+                    try { ok = RunConvert(item, targets[item]); }
                     catch (Exception ex) { item.Error = ex.Message; }
                     item.Percent = ok ? 100 : 0;
                     item.Running = false;
@@ -6836,8 +7139,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         };
         refreshCards();
         dialog.ShowDialog(this);
+        closing = true;
         uiTimer.Stop();
         uiTimer.Dispose();
+        foreach (Image picture in thumbnails) picture.Dispose();
+        thumbnails.Clear();
         dialog.Dispose();
     }
 
