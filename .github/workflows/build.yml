@@ -1,0 +1,33 @@
+name: Compilar e publicar
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar o YT Downloader
+        shell: pwsh
+        run: ./build-ci.ps1
+
+      - name: Publicar a versao (Releases)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $info = Get-Content latest.json -Raw | ConvertFrom-Json
+          $tag = "v$($info.version)"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist/YT-Downloader.exe --clobber
+          } else {
+            gh release create $tag dist/YT-Downloader.exe --title "YT Downloader $tag" --notes "$($info.notes)"
+          }
