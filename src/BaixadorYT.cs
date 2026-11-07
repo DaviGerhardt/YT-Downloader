@@ -91,26 +91,288 @@ internal sealed class QueueVideoRow
     public Label MusicStatus;
 }
 
-internal sealed class RoundedPanel : Panel
+// ===================== v5: animações e vidro =====================
+
+// Motor de animação único: um só timer (~60 fps) movimenta tudo e para sozinho quando não há nada animando.
+// Respeita a opção "Efeitos de animação" do Windows: se estiver desligada, tudo vai direto ao estado final.
+internal static class Motion
+{
+    private sealed class Anim
+    {
+        public object Key;
+        public long Start;
+        public int Duration;
+        public Action<double> Step;
+        public Action Done;
+        public Func<double, double> Ease;
+    }
+
+    private static readonly List<Anim> running = new List<Anim>();
+    private static readonly Stopwatch clock = Stopwatch.StartNew();
+    private static Timer timer;
+    private static bool enabledCache = true;
+    private static long enabledCheckedAt = -100000;
+
+    [DllImport("user32.dll")]
+    private static extern bool SystemParametersInfo(int action, int param, ref int value, int winIni);
+
+    public static bool Enabled
+    {
+        get
+        {
+            long now = clock.ElapsedMilliseconds;
+            if (now - enabledCheckedAt > 3000)
+            {
+                enabledCheckedAt = now;
+                try
+                {
+                    int on = 1;
+                    // SPI_GETCLIENTAREAANIMATION
+                    if (SystemParametersInfo(0x1042, 0, ref on, 0)) enabledCache = on != 0;
+                }
+                catch { enabledCache = true; }
+            }
+            return enabledCache;
+        }
+    }
+
+    public static double EaseOutCubic(double t) { double u = 1 - t; return 1 - u * u * u; }
+    public static double EaseInOutCubic(double t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2; }
+    public static double EaseOutBack(double t)
+    {
+        const double c1 = 1.4;
+        const double c3 = c1 + 1;
+        double u = t - 1;
+        return 1 + c3 * u * u * u + c1 * u * u;
+    }
+
+    public static void Run(object key, int durationMs, Action<double> step, Action done)
+    {
+        Run(key, durationMs, step, done, EaseOutCubic);
+    }
+
+    // Inicia (ou substitui, se já houver uma com a mesma chave) uma animação. step recebe o progresso já suavizado (0 a 1).
+    public static void Run(object key, int durationMs, Action<double> step, Action done, Func<double, double> ease)
+    {
+        Stop(key);
+        if (!Enabled || durationMs <= 0)
+        {
+            try { step(1); if (done != null) done(); }
+            catch { }
+            return;
+        }
+        Anim anim = new Anim();
+        anim.Key = key;
+        anim.Start = clock.ElapsedMilliseconds;
+        anim.Duration = durationMs;
+        anim.Step = step;
+        anim.Done = done;
+        anim.Ease = ease ?? EaseOutCubic;
+        running.Add(anim);
+        if (timer == null)
+        {
+            timer = new Timer();
+            timer.Interval = 15;
+            timer.Tick += delegate { Tick(); };
+        }
+        if (!timer.Enabled) timer.Start();
+    }
+
+    public static void Stop(object key)
+    {
+        for (int i = running.Count - 1; i >= 0; i--)
+            if (Equals(running[i].Key, key)) running.RemoveAt(i);
+    }
+
+    public static bool IsRunning(object key)
+    {
+        foreach (Anim anim in running) if (Equals(anim.Key, key)) return true;
+        return false;
+    }
+
+    private static void Tick()
+    {
+        long now = clock.ElapsedMilliseconds;
+        Anim[] snapshot = running.ToArray();
+        foreach (Anim anim in snapshot)
+        {
+            if (!running.Contains(anim)) continue;
+            double t = Math.Min(1.0, (now - anim.Start) / (double)anim.Duration);
+            bool finished = t >= 1.0;
+            try
+            {
+                anim.Step(finished ? 1.0 : anim.Ease(t));
+            }
+            catch
+            {
+                running.Remove(anim);
+                continue;
+            }
+            if (finished)
+            {
+                running.Remove(anim);
+                try { if (anim.Done != null) anim.Done(); }
+                catch { }
+            }
+        }
+        if (running.Count == 0 && timer != null) timer.Stop();
+    }
+
+    // Janelas abrem com um fade curto.
+    public static void FadeIn(Form form)
+    {
+        if (!Enabled) return;
+        object key = new object();
+        form.Opacity = 0;
+        form.Shown += delegate
+        {
+            Run(key, 180, delegate(double t) { if (!form.IsDisposed) form.Opacity = t; }, null);
+        };
+    }
+
+    public static Color Mix(Color from, Color to, double amount)
+    {
+        amount = Math.Max(0, Math.Min(1, amount));
+        return Color.FromArgb(
+            (int)Math.Round(from.A + (to.A - from.A) * amount),
+            (int)Math.Round(from.R + (to.R - from.R) * amount),
+            (int)Math.Round(from.G + (to.G - from.G) * amount),
+            (int)Math.Round(from.B + (to.B - from.B) * amount));
+    }
+}
+
+// Um controle que sabe pintar o próprio fundo (vidro) para os filhos translúcidos que estão por cima dele.
+internal interface IGlassSurface
+{
+    void PaintGlass(Graphics graphics);
+}
+
+internal static class Glass
+{
+    // Pinta, no controle, o que está atrás dele (o fundo borrado da janela e os cards translúcidos no caminho).
+    public static void PaintBehind(Control control, Graphics graphics)
+    {
+        Control parent = control.Parent;
+        int dx = control.Left;
+        int dy = control.Top;
+        while (parent != null)
+        {
+            IGlassSurface glass = parent as IGlassSurface;
+            if (glass != null)
+            {
+                GraphicsState state = graphics.Save();
+                try
+                {
+                    graphics.TranslateTransform(-dx, -dy);
+                    glass.PaintGlass(graphics);
+                }
+                finally { graphics.Restore(state); }
+                return;
+            }
+            if (parent.BackColor.A == 255 || parent.Parent == null || parent is Form)
+            {
+                graphics.Clear(parent.BackColor.A == 255 ? parent.BackColor : SystemColors.Control);
+                return;
+            }
+            dx += parent.Left;
+            dy += parent.Top;
+            parent = parent.Parent;
+        }
+        graphics.Clear(SystemColors.Control);
+    }
+
+    public static void EnableDoubleBuffer(Control control)
+    {
+        try
+        {
+            PropertyInfo property = typeof(Control).GetProperty("DoubleBuffered", BindingFlags.NonPublic | BindingFlags.Instance);
+            if (property != null) property.SetValue(control, true, null);
+        }
+        catch { }
+    }
+
+    // Fundo da janela: manchas de cor bem borradas (desenhadas pequenas e ampliadas com suavização).
+    // As posições usam pixels fixos no eixo vertical, então o fundo não "pula" quando a janela cresce.
+    public static Bitmap CreateBackdrop(int width, int height, bool dark)
+    {
+        const int scale = 6;
+        int sw = Math.Max(8, width / scale);
+        int sh = Math.Max(8, height / scale);
+        Color baseColor = dark ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
+        Bitmap result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        using (Bitmap small = new Bitmap(sw, sh, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
+        {
+            using (Graphics g = Graphics.FromImage(small))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.Clear(baseColor);
+                float w = width / (float)scale;
+                DrawBlob(g, w * 0.06f, 30f / scale, 400f / scale, Color.FromArgb(dark ? 105 : 80, 16, 185, 129));
+                DrawBlob(g, w * 1.00f, 250f / scale, 380f / scale, Color.FromArgb(dark ? 70 : 60, 14, 165, 233));
+                DrawBlob(g, w * 0.55f, 640f / scale, 430f / scale, Color.FromArgb(dark ? 60 : 45, 139, 92, 246));
+                DrawBlob(g, w * 0.00f, 900f / scale, 380f / scale, Color.FromArgb(dark ? 55 : 45, 16, 185, 129));
+                DrawBlob(g, w * 1.00f, 1050f / scale, 320f / scale, Color.FromArgb(dark ? 35 : 30, 236, 72, 153));
+            }
+            using (Graphics g = Graphics.FromImage(result))
+            using (System.Drawing.Imaging.ImageAttributes attributes = new System.Drawing.Imaging.ImageAttributes())
+            {
+                attributes.SetWrapMode(WrapMode.TileFlipXY);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(small, new Rectangle(0, 0, width, height), 0, 0, sw, sh, GraphicsUnit.Pixel, attributes);
+            }
+        }
+        return result;
+    }
+
+    private static void DrawBlob(Graphics g, float cx, float cy, float radius, Color color)
+    {
+        using (GraphicsPath path = new GraphicsPath())
+        {
+            path.AddEllipse(cx - radius, cy - radius, radius * 2, radius * 2);
+            using (PathGradientBrush brush = new PathGradientBrush(path))
+            {
+                brush.CenterPoint = new PointF(cx, cy);
+                brush.CenterColor = color;
+                brush.SurroundColors = new Color[] { Color.FromArgb(0, color) };
+                Blend blend = new Blend();
+                blend.Positions = new float[] { 0f, 0.2f, 0.4f, 0.6f, 0.8f, 1f };
+                blend.Factors = new float[] { 0f, 0.1f, 0.32f, 0.62f, 0.88f, 1f };
+                brush.Blend = blend;
+                g.FillPath(brush, path);
+            }
+        }
+    }
+}
+
+internal sealed class RoundedPanel : Panel, IGlassSurface
 {
     private readonly int radius;
     public Color BorderColor { get; set; }
+    // 255 = sólido (como antes). Menor que 255 = card de vidro: o fundo borrado da janela aparece através dele.
+    public int GlassAlpha { get; set; }
 
     public RoundedPanel(int cornerRadius)
     {
         radius = cornerRadius;
         BorderColor = Color.Transparent;
+        GlassAlpha = 255;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
+        PaintGlass(e.Graphics);
+    }
+
+    public void PaintGlass(Graphics graphics)
+    {
+        Glass.PaintBehind(this, graphics);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.CompositingQuality = CompositingQuality.HighQuality;
         using (GraphicsPath path = MakePath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
-        using (SolidBrush brush = new SolidBrush(BackColor)) e.Graphics.FillPath(brush, path);
+        using (SolidBrush brush = new SolidBrush(Color.FromArgb(Math.Max(0, Math.Min(255, GlassAlpha)), BackColor))) graphics.FillPath(brush, path);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -140,12 +402,18 @@ internal sealed class RoundedButton : Control
     private readonly int radius;
     private bool isHovering;
     private bool isPressed;
+    private double hoverAmount;
+    private double pressAmount;
+    private readonly object hoverMotion = new object();
+    private readonly object pressMotion = new object();
     public Color BorderColor { get; set; }
+    public int GlassAlpha { get; set; }
 
     public RoundedButton(int cornerRadius)
     {
         radius = cornerRadius;
         BorderColor = Color.Transparent;
+        GlassAlpha = 255;
         Cursor = Cursors.Hand;
         TabStop = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint |
@@ -160,7 +428,7 @@ internal sealed class RoundedButton : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+        Glass.PaintBehind(this, e.Graphics);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -171,11 +439,17 @@ internal sealed class RoundedButton : Control
         e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
         Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
         Color fill = BackColor;
+        int alpha = Math.Max(0, Math.Min(255, GlassAlpha));
         if (!Enabled) fill = Blend(fill, Parent == null ? SystemColors.Control : Parent.BackColor, 0.5);
-        else if (isPressed) fill = Blend(fill, Color.Black, 0.12);
-        else if (isHovering) fill = Blend(fill, Color.White, 0.08);
+        else
+        {
+            // Hover e clique mudam a cor suavemente (animados), e o vidro fica um pouco mais denso no hover.
+            if (hoverAmount > 0) fill = Blend(fill, Color.White, 0.08 * hoverAmount);
+            if (pressAmount > 0) fill = Blend(fill, Color.Black, 0.12 * pressAmount);
+            if (alpha < 255) alpha = Math.Min(255, alpha + (int)(45 * hoverAmount));
+        }
         using (GraphicsPath path = RoundedPanel.MakePath(bounds, radius))
-        using (SolidBrush brush = new SolidBrush(fill)) e.Graphics.FillPath(brush, path);
+        using (SolidBrush brush = new SolidBrush(Color.FromArgb(alpha, fill))) e.Graphics.FillPath(brush, path);
         if (BorderColor.A > 0)
         {
             using (GraphicsPath path = RoundedPanel.MakePath(bounds, radius))
@@ -191,17 +465,47 @@ internal sealed class RoundedButton : Control
         }
     }
 
-    protected override void OnMouseEnter(EventArgs e) { isHovering = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { isHovering = false; isPressed = false; Invalidate(); base.OnMouseLeave(e); }
+    private void AnimateHover(bool on)
+    {
+        double from = hoverAmount;
+        double to = on ? 1 : 0;
+        Motion.Run(hoverMotion, on ? 140 : 220, delegate(double t)
+        {
+            hoverAmount = from + (to - from) * t;
+            if (!IsDisposed) Invalidate();
+        }, null);
+    }
+
+    private void AnimatePress(bool on)
+    {
+        double from = pressAmount;
+        double to = on ? 1 : 0;
+        // Afundar é quase instantâneo (resposta imediata ao clique); soltar é um pouco mais lento.
+        Motion.Run(pressMotion, on ? 60 : 200, delegate(double t)
+        {
+            pressAmount = from + (to - from) * t;
+            if (!IsDisposed) Invalidate();
+        }, null);
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { isHovering = true; AnimateHover(true); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        isHovering = false;
+        AnimateHover(false);
+        if (isPressed) { isPressed = false; AnimatePress(false); }
+        base.OnMouseLeave(e);
+    }
     protected override void OnMouseDown(MouseEventArgs e)
     {
-        if (e.Button == MouseButtons.Left && Enabled) { isPressed = true; Focus(); Capture = true; }
+        if (e.Button == MouseButtons.Left && Enabled) { isPressed = true; Focus(); Capture = true; AnimatePress(true); }
         Invalidate();
         base.OnMouseDown(e);
     }
     protected override void OnMouseUp(MouseEventArgs e)
     {
         bool activate = isPressed && e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location) && Enabled;
+        if (isPressed) AnimatePress(false);
         isPressed = false;
         Capture = false;
         Invalidate();
@@ -210,16 +514,23 @@ internal sealed class RoundedButton : Control
     }
     protected override void OnKeyDown(KeyEventArgs e)
     {
-        if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled) { isPressed = true; Invalidate(); e.Handled = true; }
+        if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled) { isPressed = true; AnimatePress(true); e.Handled = true; }
         base.OnKeyDown(e);
     }
     protected override void OnKeyUp(KeyEventArgs e)
     {
         bool activate = isPressed && (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled;
+        if (isPressed) AnimatePress(false);
         isPressed = false;
         Invalidate();
         base.OnKeyUp(e);
         if (activate) OnClick(EventArgs.Empty);
+    }
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        // Botão escondido não pode ficar "preso" no hover.
+        if (!Visible) { isHovering = false; isPressed = false; Motion.Stop(hoverMotion); Motion.Stop(pressMotion); hoverAmount = 0; pressAmount = 0; }
+        base.OnVisibleChanged(e);
     }
     protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
 
@@ -252,7 +563,7 @@ internal sealed class RoundedThumbnail : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+        Glass.PaintBehind(this, e.Graphics);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -287,12 +598,37 @@ internal sealed class RoundedThumbnail : Control
 internal sealed class PercentBar : Control
 {
     private int value;
+    private double shownValue;
+    private readonly object valueMotion = new object();
+    private readonly Timer sheenTimer = new Timer();
+    private readonly Stopwatch sheenClock = Stopwatch.StartNew();
     public Color TrackColor { get; set; }
     public Color FillColor { get; set; }
     public int Value
     {
         get { return value; }
-        set { this.value = Math.Max(0, Math.Min(100, value)); Invalidate(); }
+        set
+        {
+            int target = Math.Max(0, Math.Min(100, value));
+            if (target == this.value) { Invalidate(); return; }
+            this.value = target;
+            UpdateSheen();
+            if (target == 0)
+            {
+                // Volta para zero sem animação (nova fila / reinício).
+                Motion.Stop(valueMotion);
+                shownValue = 0;
+                Invalidate();
+                return;
+            }
+            // A barra desliza até o novo valor em vez de pular.
+            double from = shownValue;
+            Motion.Run(valueMotion, 350, delegate(double t)
+            {
+                shownValue = from + (target - from) * t;
+                if (!IsDisposed) Invalidate();
+            }, null);
+        }
     }
 
     public PercentBar()
@@ -300,11 +636,33 @@ internal sealed class PercentBar : Control
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
         TrackColor = Color.FromArgb(226, 232, 240);
         FillColor = Color.FromArgb(16, 185, 129);
+        sheenTimer.Interval = 30;
+        sheenTimer.Tick += delegate { if (Visible) Invalidate(); };
+    }
+
+    // Um brilho suave percorre a barra enquanto o download está em andamento.
+    private void UpdateSheen()
+    {
+        bool active = value > 0 && value < 100 && Visible && Motion.Enabled;
+        if (active && !sheenTimer.Enabled) sheenTimer.Start();
+        else if (!active && sheenTimer.Enabled) { sheenTimer.Stop(); Invalidate(); }
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        UpdateSheen();
+        base.OnVisibleChanged(e);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { Motion.Stop(valueMotion); sheenTimer.Stop(); sheenTimer.Dispose(); }
+        base.Dispose(disposing);
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+        Glass.PaintBehind(this, e.Graphics);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -316,12 +674,32 @@ internal sealed class PercentBar : Control
         Rectangle track = new Rectangle(0, 1, Width - 1, Height - 2);
         using (GraphicsPath trackPath = RoundedPanel.MakePath(track, Math.Max(1, track.Height / 2)))
         using (SolidBrush trackBrush = new SolidBrush(TrackColor)) e.Graphics.FillPath(trackBrush, trackPath);
-        int fillWidth = (Width - 1) * value / 100;
+        int fillWidth = (int)Math.Round((Width - 1) * shownValue / 100.0);
         if (fillWidth > 0)
         {
             Rectangle fill = new Rectangle(0, 1, Math.Max(1, fillWidth), Height - 2);
             using (GraphicsPath fillPath = RoundedPanel.MakePath(fill, Math.Max(1, Math.Min(fill.Height, fill.Width) / 2)))
-            using (SolidBrush fillBrush = new SolidBrush(FillColor)) e.Graphics.FillPath(fillBrush, fillPath);
+            {
+                using (SolidBrush fillBrush = new SolidBrush(FillColor)) e.Graphics.FillPath(fillBrush, fillPath);
+                if (sheenTimer.Enabled && fill.Width > 8)
+                {
+                    const int band = 90;
+                    int travel = fill.Width + band * 2;
+                    int x = (int)(sheenClock.ElapsedMilliseconds * 0.28 % travel) - band;
+                    Rectangle sheen = new Rectangle(x, fill.Y, band, fill.Height);
+                    using (LinearGradientBrush brush = new LinearGradientBrush(new Rectangle(x - 1, fill.Y, band + 2, Math.Max(1, fill.Height)),
+                        Color.FromArgb(0, Color.White), Color.FromArgb(0, Color.White), LinearGradientMode.Horizontal))
+                    {
+                        ColorBlend blend = new ColorBlend();
+                        blend.Colors = new Color[] { Color.FromArgb(0, Color.White), Color.FromArgb(90, Color.White), Color.FromArgb(0, Color.White) };
+                        blend.Positions = new float[] { 0f, 0.5f, 1f };
+                        brush.InterpolationColors = blend;
+                        e.Graphics.SetClip(fillPath);
+                        e.Graphics.FillRectangle(brush, sheen);
+                        e.Graphics.ResetClip();
+                    }
+                }
+            }
         }
     }
 }
@@ -724,7 +1102,7 @@ internal sealed class TimeRangeSlider : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+        Glass.PaintBehind(this, e.Graphics);
     }
 
     private double FadeGain(double t)
@@ -971,7 +1349,7 @@ internal sealed class VolumeControl : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
+        Glass.PaintBehind(this, e.Graphics);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -1252,9 +1630,9 @@ internal sealed class DownloadJob
     public double SectionSeconds;
 }
 
-internal sealed class DownloaderForm : Form
+internal sealed class DownloaderForm : Form, IGlassSurface
 {
-    internal const string AppVersion = "4.1";
+    internal const string AppVersion = "5.0";
     private readonly Label versionLabel = new Label();
     private readonly QueueTextBox urlBox = new QueueTextBox();
     private readonly RoundedPanel urlSurface = new RoundedPanel(10);
@@ -1365,8 +1743,13 @@ internal sealed class DownloaderForm : Form
     private readonly Timer toastTimer = new Timer();
     private string toastRevealPath;
     private Action toastAction;
-    private readonly Timer toastSlideTimer = new Timer();
-    private int toastSlideTarget;
+    private readonly object toastMotion = new object();
+    private readonly object resizeMotion = new object();
+    private readonly object themeMotion = new object();
+    private readonly object windowMotion = new object();
+    private int resizeTarget = -1;
+    private Bitmap backdrop;
+    private bool backdropDark;
     private readonly Label sizeEstimateLabel = new Label();
     private readonly RoundedButton converterButton = new RoundedButton(12);
     private readonly Timer estimateTimer = new Timer();
@@ -1382,6 +1765,7 @@ internal sealed class DownloaderForm : Form
     public DownloaderForm()
     {
         Text = "YT Downloader - by revmpt  ·  v" + AppVersion;
+        DoubleBuffered = true;
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(720, 560);
@@ -1412,7 +1796,7 @@ internal sealed class DownloaderForm : Form
 
         themeButton.SetBounds(652, 26, 40, 34);
         themeButton.Cursor = Cursors.Hand;
-        themeButton.Click += delegate { darkMode = !darkMode; ApplyTheme(); };
+        themeButton.Click += delegate { ToggleThemeAnimated(); };
         Controls.Add(themeButton);
 
         historyButton.Text = "Downloads";
@@ -1495,16 +1879,18 @@ internal sealed class DownloaderForm : Form
         // Minimizar durante um download: o app vai para perto do relógio e continua baixando.
         Resize += delegate { if (WindowState == FormWindowState.Minimized && isDownloading && Visible) MinimizeToTray(); };
         Activated += delegate { CheckClipboardForLinks(); };
-        Opacity = 0;
-        Timer fadeIn = new Timer();
-        fadeIn.Interval = 15;
-        fadeIn.Tick += delegate
+        if (Motion.Enabled) Opacity = 0;
+        Shown += delegate
         {
-            double next = Opacity + 0.12;
-            if (next >= 1) { Opacity = 1; fadeIn.Stop(); fadeIn.Dispose(); }
-            else Opacity = next;
+            // Abre com fade e sobe alguns pixels, de forma suave.
+            int finalTop = Top;
+            Top = finalTop + 14;
+            Motion.Run(windowMotion, 320, delegate(double t)
+            {
+                Opacity = t;
+                Top = finalTop + (int)Math.Round(14 * (1 - t));
+            }, delegate { Opacity = 1; Top = finalTop; });
         };
-        Shown += delegate { fadeIn.Start(); };
         Shown += delegate
         {
             try
@@ -1612,13 +1998,6 @@ internal sealed class DownloaderForm : Form
         toastPanel.Controls.Add(toastButton);
         toastPanel.Click += delegate { HideToast(); };
         Controls.Add(toastPanel);
-        toastSlideTimer.Interval = 15;
-        toastSlideTimer.Tick += delegate
-        {
-            int distance = toastPanel.Top - toastSlideTarget;
-            if (distance <= 1) { toastPanel.Top = toastSlideTarget; toastSlideTimer.Stop(); return; }
-            toastPanel.Top -= Math.Max(1, (int)Math.Ceiling(distance * 0.35));
-        };
         toastTimer.Interval = 4500;
         toastTimer.Tick += delegate { HideToast(); };
 
@@ -2038,12 +2417,35 @@ internal sealed class DownloaderForm : Form
         sizeEstimateLabel.Visible = previewShown && !isDownloading && sizeEstimateLabel.Text.Length > 0;
 
         Size client = new Size(720, 560 + off + extra);
-        if (ClientSize != client)
+        ResizeClientSmoothly(client);
+    }
+
+    // A janela cresce/encolhe suavemente quando a prévia ou o painel de corte aparecem.
+    private void ResizeClientSmoothly(Size client)
+    {
+        if (Motion.IsRunning(resizeMotion) && resizeTarget == client.Height) return;
+        if (ClientSize == client) { Motion.Stop(resizeMotion); resizeTarget = client.Height; MinimumSize = Size; return; }
+        resizeTarget = client.Height;
+        if (!Visible || !IsHandleCreated || WindowState != FormWindowState.Normal || !Motion.Enabled)
         {
+            Motion.Stop(resizeMotion);
             MinimumSize = Size.Empty;
             ClientSize = client;
             MinimumSize = Size;
+            return;
         }
+        int from = ClientSize.Height;
+        int width = client.Width;
+        int to = client.Height;
+        MinimumSize = Size.Empty;
+        Motion.Run(resizeMotion, 260, delegate(double t)
+        {
+            ClientSize = new Size(width, from + (int)Math.Round((to - from) * t));
+        }, delegate
+        {
+            ClientSize = new Size(width, to);
+            MinimumSize = Size;
+        }, Motion.EaseInOutCubic);
     }
 
     private static string FormatTime(int totalSeconds)
@@ -3315,8 +3717,13 @@ internal sealed class DownloaderForm : Form
     private void ApplyTheme()
     {
         // Neutral charcoal surfaces keep dark mode from reading as navy blue.
-        Color background = darkMode ? Color.FromArgb(31, 31, 31) : Color.FromArgb(241, 245, 249);
+        // v5: o fundo da janela é borrado e os cards/botões são de vidro (translúcidos) por cima dele.
+        Color background = darkMode ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
         Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
+        Color cardColor = darkMode ? Color.FromArgb(40, 40, 46) : Color.White;
+        int cardAlpha = darkMode ? 165 : 170;
+        int buttonAlpha = darkMode ? 140 : 180;
+        Color glassBorder = darkMode ? Color.FromArgb(40, 255, 255, 255) : Color.FromArgb(120, 148, 163, 184);
         Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
         Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
         BackColor = background;
@@ -3443,7 +3850,47 @@ internal sealed class DownloaderForm : Form
         updateButton.BackColor = surface;
         updateButton.ForeColor = mainText;
         updateButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        ApplyGlass(cardColor, cardAlpha, buttonAlpha, glassBorder);
         UpdateEngineButtonLook();
+        Invalidate(true);
+    }
+
+    // Deixa cards, botões e textos da janela principal translúcidos sobre o fundo borrado.
+    // Campos de texto e listas continuam sólidos (o Windows não desenha esses controles sobre vidro).
+    private void ApplyGlass(Color cardColor, int cardAlpha, int buttonAlpha, Color glassBorder)
+    {
+        foreach (RoundedPanel card in new RoundedPanel[] { previewCard, trimPanel })
+        {
+            card.BackColor = cardColor;
+            card.GlassAlpha = cardAlpha;
+            card.BorderColor = glassBorder;
+        }
+        foreach (RoundedButton button in new RoundedButton[] { themeButton, historyButton, updateButton, converterButton, queueButton,
+            browseButton, localFileButton, thumbnailSaveButton, addSegmentButton, trimResetButton, trimPlayButton })
+        {
+            button.GlassAlpha = buttonAlpha;
+            if (button != themeButton) button.BorderColor = glassBorder;
+            button.Invalidate();
+        }
+        trimSegmentsFlow.BackColor = Color.Transparent;
+        progress.TrackColor = darkMode ? Color.FromArgb(60, 255, 255, 255) : Color.FromArgb(70, 100, 116, 139);
+        timeRangeSlider.WaveBackColor = darkMode ? Color.FromArgb(70, 0, 0, 0) : Color.FromArgb(150, 255, 255, 255);
+        MakeLabelsGlass(this);
+    }
+
+    private void MakeLabelsGlass(Control root)
+    {
+        RoundedPanel rootPanel = root as RoundedPanel;
+        bool glassParent = root == this || (rootPanel != null && rootPanel.GlassAlpha < 255);
+        foreach (Control child in root.Controls)
+        {
+            if (glassParent && (child is Label || child is CheckBox))
+            {
+                if (child.BackColor != Color.Transparent) child.BackColor = Color.Transparent;
+                Glass.EnableDoubleBuffer(child);
+            }
+            if (child is RoundedPanel) MakeLabelsGlass(child);
+        }
     }
 
     private void UpdateFormats()
@@ -3723,6 +4170,7 @@ internal sealed class DownloaderForm : Form
         Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
 
         Form dialog = new Form();
+        Motion.FadeIn(dialog);
         dialog.Text = "Downloads";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -3900,6 +4348,7 @@ internal sealed class DownloaderForm : Form
         Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
 
         Form dialog = new Form();
+        Motion.FadeIn(dialog);
         dialog.Text = "Fila de downloads";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -5403,6 +5852,141 @@ internal sealed class DownloaderForm : Form
 
     // ===================== Acabamento visual =====================
 
+    // Fundo translúcido: manchas de cor borradas, geradas uma vez por tema e reaproveitadas.
+    private Bitmap GetBackdrop()
+    {
+        int width = Math.Max(1, ClientSize.Width);
+        int height = Math.Max(1100, ClientSize.Height);
+        if (backdrop != null && backdropDark == darkMode && backdrop.Width == width && backdrop.Height >= height) return backdrop;
+        Bitmap fresh = Glass.CreateBackdrop(width, height + 200, darkMode);
+        if (backdrop != null) backdrop.Dispose();
+        backdrop = fresh;
+        backdropDark = darkMode;
+        return backdrop;
+    }
+
+    public void PaintGlass(Graphics graphics)
+    {
+        Bitmap image = GetBackdrop();
+        RectangleF clip = graphics.VisibleClipBounds;
+        Rectangle area = Rectangle.Intersect(
+            new Rectangle((int)Math.Floor(clip.X) - 1, (int)Math.Floor(clip.Y) - 1, (int)Math.Ceiling(clip.Width) + 3, (int)Math.Ceiling(clip.Height) + 3),
+            new Rectangle(0, 0, image.Width, image.Height));
+        if (area.Width <= 0 || area.Height <= 0) { graphics.Clear(BackColor); return; }
+        InterpolationMode interpolation = graphics.InterpolationMode;
+        graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+        graphics.DrawImage(image, area, area, GraphicsUnit.Pixel);
+        graphics.InterpolationMode = interpolation;
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e)
+    {
+        PaintGlass(e.Graphics);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && backdrop != null) { backdrop.Dispose(); backdrop = null; }
+        base.Dispose(disposing);
+    }
+
+    // Por cima da janela, mostra a "foto" do tema antigo e some aos poucos, revelando o tema novo.
+    private sealed class ThemeFadeOverlay : Form
+    {
+        public ThemeFadeOverlay(Bitmap snapshot)
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            BackgroundImage = snapshot;
+            BackgroundImageLayout = ImageLayout.None;
+            DoubleBuffered = true;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x80 | 0x20 | 0x08000000; // ferramenta, clique atravessa, não ativa
+                return cp;
+            }
+        }
+    }
+
+    private ThemeFadeOverlay themeOverlay;
+    private Bitmap themeSnapshot;
+
+    private void FinishThemeFade()
+    {
+        Motion.Stop(themeMotion);
+        if (themeOverlay != null)
+        {
+            try { themeOverlay.Close(); themeOverlay.Dispose(); }
+            catch { }
+            themeOverlay = null;
+        }
+        if (themeSnapshot != null) { themeSnapshot.Dispose(); themeSnapshot = null; }
+    }
+
+    private void ToggleThemeAnimated()
+    {
+        FinishThemeFade();
+        Bitmap snapshot = null;
+        Rectangle area = Rectangle.Empty;
+        if (Motion.Enabled && Visible && WindowState == FormWindowState.Normal && Opacity >= 1)
+        {
+            try
+            {
+                area = RectangleToScreen(ClientRectangle);
+                if (SystemInformation.VirtualScreen.Contains(area))
+                {
+                    snapshot = new Bitmap(area.Width, area.Height);
+                    using (Graphics g = Graphics.FromImage(snapshot)) g.CopyFromScreen(area.Location, Point.Empty, area.Size);
+                }
+            }
+            catch
+            {
+                if (snapshot != null) snapshot.Dispose();
+                snapshot = null;
+            }
+        }
+        ThemeFadeOverlay overlay = null;
+        if (snapshot != null)
+        {
+            try
+            {
+                overlay = new ThemeFadeOverlay(snapshot);
+                overlay.Bounds = area;
+                overlay.Opacity = 1;
+                overlay.Show(this);
+                overlay.Update();
+            }
+            catch
+            {
+                if (overlay != null) overlay.Dispose();
+                overlay = null;
+            }
+        }
+        darkMode = !darkMode;
+        ApplyTheme();
+        if (overlay == null)
+        {
+            if (snapshot != null) snapshot.Dispose();
+            return;
+        }
+        Refresh();
+        themeOverlay = overlay;
+        themeSnapshot = snapshot;
+        ThemeFadeOverlay fading = overlay;
+        Motion.Run(themeMotion, 300, delegate(double t)
+        {
+            if (!fading.IsDisposed) fading.Opacity = 1 - t;
+        }, delegate { FinishThemeFade(); }, Motion.EaseInOutCubic);
+    }
+
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 
@@ -5447,13 +6031,16 @@ internal sealed class DownloaderForm : Form
         toastTimer.Interval = 4500;
         // Fica na faixa de baixo, à esquerda do botão Baixar.
         int finalTop = downloadButton.Top - 4;
-        toastPanel.SetBounds(28, finalTop + 14, 520, 46);
+        toastPanel.SetBounds(28, finalTop + 16, 520, 46);
+        toastPanel.Enabled = true;
         toastPanel.Visible = true;
         toastPanel.BringToFront();
-        // Desliza alguns pixels para cima (animação curta e suave).
-        toastSlideTarget = finalTop;
-        toastSlideTimer.Stop();
-        toastSlideTimer.Start();
+        // Desliza para cima com um leve "quique" no final.
+        int startTop = finalTop + 16;
+        Motion.Run(toastMotion, 360, delegate(double t)
+        {
+            toastPanel.Top = startTop + (int)Math.Round((finalTop - startTop) * t);
+        }, null, Motion.EaseOutBack);
         toastTimer.Stop();
         toastTimer.Start();
     }
@@ -5532,8 +6119,16 @@ internal sealed class DownloaderForm : Form
     private void HideToast()
     {
         toastTimer.Stop();
-        toastPanel.Visible = false;
         toastRevealPath = null;
+        toastAction = null;
+        if (!toastPanel.Visible) return;
+        // Sai deslizando para baixo; não aceita cliques enquanto some.
+        toastPanel.Enabled = false;
+        int startTop = toastPanel.Top;
+        Motion.Run(toastMotion, 180, delegate(double t)
+        {
+            toastPanel.Top = startTop + (int)Math.Round(16 * t);
+        }, delegate { toastPanel.Visible = false; toastPanel.Enabled = true; }, Motion.EaseInOutCubic);
     }
 
     // ===================== Link copiado =====================
@@ -5911,6 +6506,7 @@ internal sealed class DownloaderForm : Form
         Color danger = darkMode ? Color.FromArgb(248, 113, 113) : Color.FromArgb(220, 38, 38);
 
         Form dialog = new Form();
+        Motion.FadeIn(dialog);
         dialog.Text = "Converter arquivos";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -6941,6 +7537,7 @@ internal sealed class DownloaderForm : Form
         bool result = false;
         using (Form dialog = new Form())
         {
+            Motion.FadeIn(dialog);
             dialog.Text = "Fila concluída";
             dialog.StartPosition = FormStartPosition.CenterParent;
             dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
