@@ -1,5 +1,5 @@
 {
-  "version": "4.1",
-  "notes": "Prévia instantânea no YouTube, motor de download mais rápido e novo conversor de arquivos (vídeo, áudio e imagem).",
-  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v4.1/YT-Downloader.exe"
+  "version": "5.0",
+  "notes": "Visual novo com fundo translúcido, cards de vidro e animações suaves. Conversor mais inteligente: mostra só os formatos que fazem sentido para cada tipo de arquivo, com miniaturas.",
+  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v5.0/YT-Downloader.exe"
 }
