@@ -94,7 +94,6 @@ internal sealed class QueueVideoRow
 // ===================== v5: animações e vidro =====================
 
 // Motor de animação único: um só timer (~60 fps) movimenta tudo e para sozinho quando não há nada animando.
-// Respeita a opção "Efeitos de animação" do Windows: se estiver desligada, tudo vai direto ao estado final.
 internal static class Motion
 {
     private sealed class Anim
@@ -110,30 +109,12 @@ internal static class Motion
     private static readonly List<Anim> running = new List<Anim>();
     private static readonly Stopwatch clock = Stopwatch.StartNew();
     private static Timer timer;
-    private static bool enabledCache = true;
-    private static long enabledCheckedAt = -100000;
 
-    [DllImport("user32.dll")]
-    private static extern bool SystemParametersInfo(int action, int param, ref int value, int winIni);
-
+    // As animações do app ficam sempre ligadas, mesmo com "Efeitos de animação" desligado no Windows
+    // (muita gente desliga essa opção só para deixar o Windows mais rápido).
     public static bool Enabled
     {
-        get
-        {
-            long now = clock.ElapsedMilliseconds;
-            if (now - enabledCheckedAt > 3000)
-            {
-                enabledCheckedAt = now;
-                try
-                {
-                    int on = 1;
-                    // SPI_GETCLIENTAREAANIMATION
-                    if (SystemParametersInfo(0x1042, 0, ref on, 0)) enabledCache = on != 0;
-                }
-                catch { enabledCache = true; }
-            }
-            return enabledCache;
-        }
+        get { return true; }
     }
 
     public static double EaseOutCubic(double t) { double u = 1 - t; return 1 - u * u * u; }
