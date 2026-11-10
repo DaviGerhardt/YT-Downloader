@@ -2316,10 +2316,22 @@ internal sealed class DownloaderForm : Form
 
     private string AppFolder { get { return Program.RuntimeDirectory; } }
 
+    // Ícone com todos os tamanhos (16 a 256 px): fica nítido na barra de título, na barra de tarefas e perto do relógio.
+    private static Icon LoadAppIcon()
+    {
+        try
+        {
+            using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("YTDownloader.Resources.app.ico"))
+                if (stream != null) return new Icon(stream);
+        }
+        catch { }
+        return Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+    }
+
     public DownloaderForm()
     {
         Text = "YT Downloader - by revmpt  ·  v" + AppVersion;
-        Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        Icon = LoadAppIcon();
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(720, 560);
         MinimumSize = new Size(736, 599);
@@ -2340,12 +2352,15 @@ internal sealed class DownloaderForm : Form
         titleLabel.Location = new Point(70, 14);
         Controls.Add(titleLabel);
 
-        versionLabel.Text = "v" + AppVersion;
         versionLabel.Text = "by revmpt  ·  v" + AppVersion;
         versionLabel.Font = new Font("Segoe UI", 8.25F);
         versionLabel.AutoSize = true;
-        versionLabel.Location = new Point(72, 38);
+        versionLabel.Location = new Point(72, 40);
         Controls.Add(versionLabel);
+        // O título é desenhado numa caixa alta; sem isto ele cobria o topo do "by revmpt · versão".
+        titleLabel.AutoSize = false;
+        titleLabel.Size = new Size(titleLabel.PreferredWidth, 26);
+        versionLabel.BringToFront();
 
         subtitleLabel.Text = "";
         subtitleLabel.Font = new Font("Segoe UI", 8.5F);
