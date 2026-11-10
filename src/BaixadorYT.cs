@@ -2377,7 +2377,7 @@ internal sealed class DownloaderForm : Form
         updateButton.Cursor = Cursors.Hand;
         updateButton.Click += delegate { UpdateEngine(true); };
         Controls.Add(updateButton);
-        musicStatusTip.SetToolTip(updateButton, "Atualiza o motor de download (yt-dlp). O app faz isso sozinho uma vez por dia.");
+        musicStatusTip.SetToolTip(updateButton, "Procura versão nova do app e do motor de download (yt-dlp).");
         if (!IsEngineUpdateDue())
         {
             engineState = 1;
@@ -2385,7 +2385,7 @@ internal sealed class DownloaderForm : Form
             if (DateTime.TryParse(engineLastCheck, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out lastCheck))
                 musicStatusTip.SetToolTip(updateButton, "Motor de download atualizado · verificado em " +
                     lastCheck.ToLocalTime().ToString("dd/MM 'às' HH:mm", CultureInfo.CurrentCulture) +
-                    "\r\nClique para verificar de novo. O app verifica sozinho uma vez por dia.");
+                    "\r\nClique para procurar atualizações do app e do motor de download.");
         }
 
         // Manutenção ao abrir: limpa sobras antigas e, uma vez por dia, atualiza o motor de download.
@@ -3800,6 +3800,16 @@ internal sealed class DownloaderForm : Form
             bool updated = false;
             string detail = "";
             string version = "";
+            // Pelo botão, verifica também se há versão nova do próprio app.
+            int appResult = -1;
+            string appVersion = AppVersion;
+            string appNotes = "";
+            string appDetail = "";
+            if (manual)
+            {
+                try { appResult = CheckAppUpdateCore(out appVersion, out appNotes, out appDetail); }
+                catch (Exception ex) { appResult = 2; appDetail = ex.Message; }
+            }
             try
             {
                 ok = UpdateYtDlpEngine(out updated, out detail);
@@ -3825,15 +3835,26 @@ internal sealed class DownloaderForm : Form
                     string versionText = version.Length > 0 ? version : "desconhecida";
                     musicStatusTip.SetToolTip(updateButton, "Motor de download (yt-dlp) versão " + versionText +
                         (ok ? " · verificado às " + DateTime.Now.ToString("HH:mm", CultureInfo.CurrentCulture) : " · última verificação falhou") +
-                        "\r\nClique para verificar de novo. O app verifica sozinho uma vez por dia.");
+                        "\r\nClique para procurar atualizações do app e do motor de download.");
                     if (!manual) return;
-                    if (ok && updated)
-                        MessageBox.Show(this, "Motor de download atualizado para a versão " + versionText + ".", "Atualizar", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    else if (ok)
-                        MessageBox.Show(this, "O motor de download já está na versão mais recente (" + versionText + ").", "Atualizar", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    else
-                        MessageBox.Show(this, "Não foi possível atualizar agora. Verifique sua internet e tente de novo." +
-                            (detail.Length > 0 ? "\r\n\r\nDetalhe: " + detail : ""), "Atualizar", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    string appLine;
+                    if (appResult == 1) appLine = "✓  App: nova versão v" + appVersion + " instalada.";
+                    else if (appResult == 0) appLine = "✓  App: já está na versão mais recente (v" + AppVersion + ").";
+                    else appLine = "✗  App: não foi possível verificar agora." + (appDetail.Length > 0 ? " (" + CompactError(appDetail) + ")" : "");
+                    string engineLine;
+                    if (ok && updated) engineLine = "✓  Motor de download: atualizado para a versão " + versionText + ".";
+                    else if (ok) engineLine = "✓  Motor de download: já está na versão mais recente (" + versionText + ").";
+                    else engineLine = "✗  Motor de download: não foi possível atualizar agora." + (detail.Length > 0 ? " (" + CompactError(detail) + ")" : "");
+                    string message = appLine + "\r\n" + engineLine;
+                    if (appResult == 2 || !ok) message += "\r\n\r\nVerifique sua internet e tente de novo.";
+                    MessageBoxIcon icon = appResult == 2 || !ok ? MessageBoxIcon.Warning : MessageBoxIcon.Information;
+                    if (appResult == 1)
+                    {
+                        if (MessageBox.Show(this, message + "\r\n\r\nReiniciar agora para usar a nova versão?", "Atualizar",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes) RestartApp();
+                        else ShowAppUpdatedToast(appVersion, appNotes);
+                    }
+                    else MessageBox.Show(this, message, "Atualizar", MessageBoxButtons.OK, icon);
                 });
             }
             catch { }
@@ -6633,8 +6654,67 @@ internal sealed class DownloaderForm : Form
 
     // Lê o latest.json do repositório; se houver versão nova, baixa o .exe e troca com segurança.
     // O .exe em uso pode ser renomeado no Windows, então a troca vale a partir da próxima abertura.
+    // Verificação automática ao abrir o app: silenciosa, só avisa se instalou uma versão nova.
     private void CheckAppUpdate()
     {
+        string version;
+        string notes;
+        string detail;
+        if (CheckAppUpdateCore(out version, out notes, out detail) != 1) return;
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke((MethodInvoker)delegate { ShowAppUpdatedToast(version, notes); }); }
+        catch { }
+    }
+
+    private void ShowAppUpdatedToast(string version, string notes)
+    {
+        string[] lines = (notes ?? "").Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        string firstNote = lines.Length > 0 ? lines[0] : "Reinicie para usar a nova versão.";
+        ShowToastAction("✓  Nova versão v" + version + " instalada", firstNote, "Reiniciar", RestartApp);
+    }
+
+    private void RestartApp()
+    {
+        try { Process.Start(Application.ExecutablePath); }
+        catch { return; }
+        Close();
+    }
+
+    private readonly object appUpdateLock = new object();
+    private string installedAppVersion;
+    private string installedAppNotes;
+
+    // Procura versão nova do app no GitHub e, se houver, baixa e troca o .exe (vale ao reiniciar).
+    // Retorna 0 = já está na mais recente, 1 = versão nova instalada, 2 = não foi possível verificar.
+    private int CheckAppUpdateCore(out string version, out string notes, out string detail)
+    {
+        version = AppVersion;
+        notes = "";
+        detail = "";
+        // Evita duas verificações ao mesmo tempo (a automática ao abrir e o botão Atualizar).
+        lock (appUpdateLock)
+        {
+            if (installedAppVersion != null)
+            {
+                version = installedAppVersion;
+                notes = installedAppNotes;
+                return 1;
+            }
+            int result = CheckAppUpdateUnlocked(out version, out notes, out detail);
+            if (result == 1)
+            {
+                installedAppVersion = version;
+                installedAppNotes = notes;
+            }
+            return result;
+        }
+    }
+
+    private int CheckAppUpdateUnlocked(out string version, out string notes, out string detail)
+    {
+        version = AppVersion;
+        notes = "";
+        detail = "";
         try
         {
             string json;
@@ -6649,10 +6729,19 @@ internal sealed class DownloaderForm : Form
             string versionText = JsonString(data, "version").Trim();
             Version latest;
             Version current;
-            if (!TryParseVersion(versionText, out latest) || !TryParseVersion(AppVersion, out current) || latest <= current) return;
+            if (!TryParseVersion(versionText, out latest) || !TryParseVersion(AppVersion, out current))
+            {
+                detail = "Não foi possível ler a versão publicada.";
+                return 2;
+            }
+            if (latest <= current) return 0;
             string url = JsonString(data, "url").Trim();
             if (url.Length == 0) url = "https://github.com/" + UpdateRepo + "/releases/download/v" + versionText + "/YT-Downloader.exe";
-            if (!url.StartsWith("https://github.com/" + UpdateRepo + "/", StringComparison.OrdinalIgnoreCase)) return;
+            if (!url.StartsWith("https://github.com/" + UpdateRepo + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                detail = "Endereço de download inválido.";
+                return 2;
+            }
             string exe = Application.ExecutablePath;
             string fresh = exe + ".novo";
             string old = exe + ".antigo";
@@ -6664,26 +6753,21 @@ internal sealed class DownloaderForm : Form
             if (new FileInfo(fresh).Length < 20L * 1024 * 1024)
             {
                 File.Delete(fresh);
-                return;
+                detail = "O arquivo baixado veio incompleto.";
+                return 2;
             }
             if (File.Exists(old)) File.Delete(old);
             File.Move(exe, old);
             File.Move(fresh, exe);
-            string notes = JsonString(data, "notes");
-            string firstNote = notes.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Length > 0
-                ? notes.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0] : "Reinicie para usar a nova versão.";
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke((MethodInvoker)delegate
-            {
-                ShowToastAction("✓  Nova versão v" + versionText + " instalada", firstNote, "Reiniciar", delegate
-                {
-                    try { Process.Start(Application.ExecutablePath); }
-                    catch { return; }
-                    Close();
-                });
-            });
+            version = versionText;
+            notes = JsonString(data, "notes");
+            return 1;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            detail = ex.Message;
+            return 2;
+        }
     }
 
     private void HideToast()
