@@ -18,7 +18,17 @@ jobs:
         shell: pwsh
         run: ./build-ci.ps1
 
+      # Arquivo para testar antes de publicar (aparece na pagina da execucao, em "Artifacts").
+      - name: Guardar o .exe para teste
+        uses: actions/upload-artifact@v4
+        with:
+          name: YT-Downloader-teste
+          path: dist/YT-Downloader.exe
+          retention-days: 14
+
+      # So publica a Release (e dispara a atualizacao automatica) a partir da main.
       - name: Publicar a versao (Releases)
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
