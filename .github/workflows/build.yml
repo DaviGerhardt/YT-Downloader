@@ -29,5 +29,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag dist/YT-Downloader.exe --clobber
           } else {
-            gh release create $tag dist/YT-Downloader.exe --title "YT Downloader $tag" --notes "$($info.notes)"
+            gh release create $tag dist/YT-Downloader.exe --target $env:GITHUB_SHA --title "YT Downloader $tag" --notes "$($info.notes)"
           }

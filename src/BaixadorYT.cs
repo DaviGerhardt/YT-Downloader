@@ -91,65 +91,93 @@ internal sealed class QueueVideoRow
     public Label MusicStatus;
 }
 
-// ===================== v5: animações e vidro =====================
-
-// Motor de animação único: um só timer (~60 fps) movimenta tudo e para sozinho quando não há nada animando.
+// ===================== Motor de animação =====================
+// Um único relógio (~60 quadros por segundo) move todas as animações do app. Ele NÃO depende da opção
+// "Efeitos de animação" do Windows: as animações funcionam sempre, mesmo com ela desligada.
 internal static class Motion
 {
     private sealed class Anim
     {
         public object Key;
         public long Start;
-        public int Duration;
+        public double Duration;
+        public bool Loop;
         public Action<double> Step;
         public Action Done;
         public Func<double, double> Ease;
     }
 
-    private static readonly List<Anim> running = new List<Anim>();
+    private static readonly List<Anim> active = new List<Anim>();
     private static readonly Stopwatch clock = Stopwatch.StartNew();
     private static Timer timer;
+    private static readonly Dictionary<Control, object> textKeys = new Dictionary<Control, object>();
 
-    // As animações do app ficam sempre ligadas, mesmo com "Efeitos de animação" desligado no Windows
-    // (muita gente desliga essa opção só para deixar o Windows mais rápido).
-    public static bool Enabled
+    // Mesmas curvas do ForeverNote: cubic-bezier(.22,1,.36,1) (suave) e cubic-bezier(.34,1.45,.64,1) (mola).
+    public static double EaseOut(double t) { return 1 - Math.Pow(1 - t, 5); }
+    public static double EaseInOut(double t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2; }
+    public static double EaseIn(double t) { return t * t * t; }
+    public static double Linear(double t) { return t; }
+    public static double Spring(double t)
     {
-        get { return true; }
-    }
-
-    public static double EaseOutCubic(double t) { double u = 1 - t; return 1 - u * u * u; }
-    public static double EaseInOutCubic(double t) { return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2; }
-    public static double EaseOutBack(double t)
-    {
-        const double c1 = 1.4;
-        const double c3 = c1 + 1;
+        const double s = 1.70158 * 1.15;
         double u = t - 1;
-        return 1 + c3 * u * u * u + c1 * u * u;
+        return 1 + (s + 1) * u * u * u + s * u * u;
     }
 
-    public static void Run(object key, int durationMs, Action<double> step, Action done)
+    public static Color Mix(Color from, Color to, double t)
     {
-        Run(key, durationMs, step, done, EaseOutCubic);
+        t = Math.Max(0, Math.Min(1, t));
+        return Color.FromArgb(
+            (int)Math.Round(from.A + (to.A - from.A) * t),
+            (int)Math.Round(from.R + (to.R - from.R) * t),
+            (int)Math.Round(from.G + (to.G - from.G) * t),
+            (int)Math.Round(from.B + (to.B - from.B) * t));
     }
 
-    // Inicia (ou substitui, se já houver uma com a mesma chave) uma animação. step recebe o progresso já suavizado (0 a 1).
-    public static void Run(object key, int durationMs, Action<double> step, Action done, Func<double, double> ease)
+    // Roda uma animação de "ms" milissegundos. Se já existir outra com a mesma chave, ela é substituída.
+    public static void Run(object key, int ms, Action<double> step, Action done = null, Func<double, double> ease = null)
     {
         Stop(key);
-        if (!Enabled || durationMs <= 0)
-        {
-            try { step(1); if (done != null) done(); }
-            catch { }
-            return;
-        }
+        Anim anim = new Anim();
+        anim.Key = key ?? new object();
+        anim.Start = clock.ElapsedMilliseconds;
+        anim.Duration = Math.Max(1, ms);
+        anim.Step = step;
+        anim.Done = done;
+        anim.Ease = ease ?? EaseOut;
+        active.Add(anim);
+        EnsureTimer();
+    }
+
+    // Repete para sempre (brilho da barra de progresso, esqueleto de carregamento) até Stop(key).
+    public static void Loop(object key, int periodMs, Action<double> step)
+    {
+        if (IsRunning(key)) return;
         Anim anim = new Anim();
         anim.Key = key;
         anim.Start = clock.ElapsedMilliseconds;
-        anim.Duration = durationMs;
+        anim.Duration = Math.Max(1, periodMs);
+        anim.Loop = true;
         anim.Step = step;
-        anim.Done = done;
-        anim.Ease = ease ?? EaseOutCubic;
-        running.Add(anim);
+        anim.Ease = Linear;
+        active.Add(anim);
+        EnsureTimer();
+    }
+
+    public static bool IsRunning(object key)
+    {
+        foreach (Anim anim in active) if (anim.Key == key) return true;
+        return false;
+    }
+
+    public static void Stop(object key)
+    {
+        if (key == null) return;
+        active.RemoveAll(delegate(Anim a) { return a.Key == key; });
+    }
+
+    private static void EnsureTimer()
+    {
         if (timer == null)
         {
             timer = new Timer();
@@ -159,300 +187,281 @@ internal static class Motion
         if (!timer.Enabled) timer.Start();
     }
 
-    public static void Stop(object key)
-    {
-        for (int i = running.Count - 1; i >= 0; i--)
-            if (Equals(running[i].Key, key)) running.RemoveAt(i);
-    }
-
-    public static bool IsRunning(object key)
-    {
-        foreach (Anim anim in running) if (Equals(anim.Key, key)) return true;
-        return false;
-    }
-
     private static void Tick()
     {
         long now = clock.ElapsedMilliseconds;
-        Anim[] snapshot = running.ToArray();
+        Anim[] snapshot = active.ToArray();
         foreach (Anim anim in snapshot)
         {
-            if (!running.Contains(anim)) continue;
-            double t = Math.Min(1.0, (now - anim.Start) / (double)anim.Duration);
-            bool finished = t >= 1.0;
-            try
-            {
-                anim.Step(finished ? 1.0 : anim.Ease(t));
-            }
-            catch
-            {
-                running.Remove(anim);
-                continue;
-            }
+            if (!active.Contains(anim)) continue;
+            double elapsed = now - anim.Start;
+            double t = anim.Loop ? (elapsed % anim.Duration) / anim.Duration : Math.Min(1.0, elapsed / anim.Duration);
+            bool finished = !anim.Loop && t >= 1.0;
+            try { anim.Step(finished ? 1.0 : anim.Ease(t)); }
+            catch { active.Remove(anim); continue; }
             if (finished)
             {
-                running.Remove(anim);
-                try { if (anim.Done != null) anim.Done(); }
-                catch { }
+                active.Remove(anim);
+                if (anim.Done != null)
+                {
+                    try { anim.Done(); }
+                    catch { }
+                }
             }
         }
-        if (running.Count == 0 && timer != null) timer.Stop();
+        if (active.Count == 0) timer.Stop();
     }
 
-    // Janelas abrem com um fade curto.
+    // Janela abre com fade e sobe alguns pixels (como os modais do ForeverNote).
     public static void FadeIn(Form form)
     {
-        if (!Enabled) return;
-        object key = new object();
         form.Opacity = 0;
         form.Shown += delegate
         {
-            Run(key, 180, delegate(double t) { if (!form.IsDisposed) form.Opacity = t; }, null);
+            int finalTop = form.Top;
+            form.Top = finalTop + 14;
+            Run(form, 260, delegate(double t)
+            {
+                if (form.IsDisposed) return;
+                form.Opacity = Math.Min(1.0, t * 1.25);
+                form.Top = finalTop + (int)Math.Round(14 * (1 - t));
+            }, delegate { if (!form.IsDisposed) { form.Opacity = 1; form.Top = finalTop; } }, EaseOut);
         };
     }
 
-    public static Color Mix(Color from, Color to, double amount)
+    // Texto aparece suavemente (a cor sai do fundo e chega na cor final).
+    public static void FadeText(Control control, Color target, int ms = 260)
     {
-        amount = Math.Max(0, Math.Min(1, amount));
-        return Color.FromArgb(
-            (int)Math.Round(from.A + (to.A - from.A) * amount),
-            (int)Math.Round(from.R + (to.R - from.R) * amount),
-            (int)Math.Round(from.G + (to.G - from.G) * amount),
-            (int)Math.Round(from.B + (to.B - from.B) * amount));
-    }
-}
-
-// Janela secundária com o mesmo fundo borrado da janela principal.
-internal class GlassForm : Form, IGlassSurface
-{
-    private Bitmap backdrop;
-    private readonly bool dark;
-
-    public GlassForm(bool darkTheme)
-    {
-        dark = darkTheme;
-        DoubleBuffered = true;
-        BackColor = dark ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
-    }
-
-    public void PaintGlass(Graphics graphics)
-    {
-        int width = Math.Max(1, ClientSize.Width);
-        int height = Math.Max(1, ClientSize.Height);
-        if (backdrop == null || backdrop.Width != width || backdrop.Height < height)
+        Color from = control.BackColor == Color.Transparent && control.Parent != null ? control.Parent.BackColor : control.BackColor;
+        object key;
+        if (!textKeys.TryGetValue(control, out key))
         {
-            Bitmap fresh = Glass.CreateBackdrop(width, Math.Max(800, height) + 200, dark);
-            if (backdrop != null) backdrop.Dispose();
-            backdrop = fresh;
+            key = new object();
+            textKeys[control] = key;
+            control.Disposed += delegate { textKeys.Remove(control); };
         }
-        Glass.DrawBackdrop(graphics, backdrop, BackColor);
-    }
-
-    protected override void OnPaintBackground(PaintEventArgs e)
-    {
-        PaintGlass(e.Graphics);
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing && backdrop != null) { backdrop.Dispose(); backdrop = null; }
-        base.Dispose(disposing);
+        Run(key, ms, delegate(double t) { if (!control.IsDisposed) control.ForeColor = Mix(from, target, t); },
+            delegate { if (!control.IsDisposed) control.ForeColor = target; });
     }
 }
 
-// Um controle que sabe pintar o próprio fundo (vidro) para os filhos translúcidos que estão por cima dele.
-internal interface IGlassSurface
+// Valor numérico que desliza até o alvo e redesenha o controle a cada quadro.
+internal sealed class AnimatedValue
 {
-    void PaintGlass(Graphics graphics);
-}
+    private readonly Control owner;
+    private double from;
+    private double to;
+    public double Value;
+    public double Target { get { return to; } }
 
-internal static class Glass
-{
-    // Pinta, no controle, o que está atrás dele (o fundo borrado da janela e os cards translúcidos no caminho).
-    public static void PaintBehind(Control control, Graphics graphics)
+    public AnimatedValue(Control owner, double initial)
     {
-        Control parent = control.Parent;
-        int dx = control.Left;
-        int dy = control.Top;
-        while (parent != null)
+        this.owner = owner;
+        Value = initial;
+        from = initial;
+        to = initial;
+    }
+
+    public void AnimateTo(double target, int ms, Func<double, double> ease = null)
+    {
+        if (Math.Abs(target - to) < 0.0001 && Motion.IsRunning(this)) return;
+        if (Math.Abs(target - Value) < 0.0001) { Motion.Stop(this); Value = target; to = target; owner.Invalidate(); return; }
+        from = Value;
+        to = target;
+        Motion.Run(this, ms, delegate(double t)
         {
-            IGlassSurface glass = parent as IGlassSurface;
-            if (glass != null)
-            {
-                GraphicsState state = graphics.Save();
-                try
-                {
-                    graphics.TranslateTransform(-dx, -dy);
-                    glass.PaintGlass(graphics);
-                }
-                finally { graphics.Restore(state); }
-                return;
-            }
-            if (parent.BackColor.A == 255 || parent.Parent == null || parent is Form)
-            {
-                graphics.Clear(parent.BackColor.A == 255 ? parent.BackColor : SystemColors.Control);
-                return;
-            }
-            dx += parent.Left;
-            dy += parent.Top;
-            parent = parent.Parent;
-        }
-        graphics.Clear(SystemColors.Control);
+            Value = from + (to - from) * t;
+            if (!owner.IsDisposed) owner.Invalidate();
+        }, null, ease);
     }
 
-    public static void EnableDoubleBuffer(Control control)
+    public void Set(double value)
+    {
+        Motion.Stop(this);
+        Value = value;
+        from = value;
+        to = value;
+    }
+}
+
+// ===================== Paleta (a mesma do ForeverNote) =====================
+internal static class Theme
+{
+    public static bool Dark;
+    private static Color Pick(int dark, int light) { return Color.FromArgb(255, Color.FromArgb(Dark ? dark : light)); }
+
+    public static Color Bg { get { return Pick(0x14161a, 0xeceef2); } }
+    public static Color Side { get { return Pick(0x17191d, 0xf1f2f5); } }
+    public static Color Surface { get { return Pick(0x1e2025, 0xffffff); } }
+    public static Color Raised { get { return Pick(0x262930, 0xffffff); } }
+    public static Color Sunken { get { return Pick(0x17191d, 0xeef0f3); } }
+    public static Color Track { get { return Pick(0x2c2f37, 0xe2e5eb); } }
+    public static Color Line { get { return Pick(0x2b2e35, 0xe0e3e9); } }
+    public static Color LineStrong { get { return Pick(0x353942, 0xd3d8e0); } }
+    public static Color Fg { get { return Pick(0xe7e9ed, 0x1a1d23); } }
+    public static Color Muted { get { return Pick(0xa0a6b1, 0x5b6270); } }
+    public static Color Faint { get { return Pick(0x6e7480, 0x8d939e); } }
+    public static Color Accent { get { return Pick(0x7d9bff, 0x4067e3); } }
+    public static Color AccentHi { get { return Pick(0x97afff, 0x3157d4); } }
+    public static Color OnAccent { get { return Pick(0x0c1430, 0xffffff); } }
+    public static Color Danger { get { return Pick(0xf07a7a, 0xd04a4a); } }
+    public static Color Ok { get { return Pick(0x4cc38a, 0x2f9e6a); } }
+    public static Color Warn { get { return Pick(0xe6b450, 0xc98a12); } }
+    public static Color AccentSoft { get { return Motion.Mix(Surface, Accent, Dark ? 0.16 : 0.11); } }
+    public static Color AccentSoftOnBg { get { return Motion.Mix(Bg, Accent, Dark ? 0.16 : 0.11); } }
+    public static Color Hover(Color under) { return Motion.Mix(under, Dark ? Color.White : Color.FromArgb(30, 40, 70), Dark ? 0.055 : 0.055); }
+    public static Color Press(Color under) { return Motion.Mix(under, Dark ? Color.White : Color.FromArgb(30, 40, 70), 0.09); }
+
+    public static Font Ui(float size, FontStyle style = FontStyle.Regular) { return new Font("Segoe UI", size, style); }
+    public static Font Semibold(float size)
     {
         try
         {
-            PropertyInfo property = typeof(Control).GetProperty("DoubleBuffered", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (property != null) property.SetValue(control, true, null);
+            Font font = new Font("Segoe UI Semibold", size);
+            if (font.Name == "Segoe UI Semibold") return font;
+            font.Dispose();
         }
         catch { }
-    }
-
-    // Fundo da janela: manchas de cor bem borradas (desenhadas pequenas e ampliadas com suavização).
-    // As posições usam pixels fixos no eixo vertical, então o fundo não "pula" quando a janela cresce.
-    public static Bitmap CreateBackdrop(int width, int height, bool dark)
-    {
-        const int scale = 6;
-        int sw = Math.Max(8, width / scale);
-        int sh = Math.Max(8, height / scale);
-        Color baseColor = dark ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
-        Bitmap result = new Bitmap(width, height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-        using (Bitmap small = new Bitmap(sw, sh, System.Drawing.Imaging.PixelFormat.Format32bppPArgb))
-        {
-            using (Graphics g = Graphics.FromImage(small))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.Clear(baseColor);
-                float w = width / (float)scale;
-                DrawBlob(g, w * 0.06f, 30f / scale, 400f / scale, Color.FromArgb(dark ? 105 : 80, 16, 185, 129));
-                DrawBlob(g, w * 1.00f, 250f / scale, 380f / scale, Color.FromArgb(dark ? 70 : 60, 14, 165, 233));
-                DrawBlob(g, w * 0.55f, 640f / scale, 430f / scale, Color.FromArgb(dark ? 60 : 45, 139, 92, 246));
-                DrawBlob(g, w * 0.00f, 900f / scale, 380f / scale, Color.FromArgb(dark ? 55 : 45, 16, 185, 129));
-                DrawBlob(g, w * 1.00f, 1050f / scale, 320f / scale, Color.FromArgb(dark ? 35 : 30, 236, 72, 153));
-            }
-            using (Graphics g = Graphics.FromImage(result))
-            using (System.Drawing.Imaging.ImageAttributes attributes = new System.Drawing.Imaging.ImageAttributes())
-            {
-                attributes.SetWrapMode(WrapMode.TileFlipXY);
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                g.DrawImage(small, new Rectangle(0, 0, width, height), 0, 0, sw, sh, GraphicsUnit.Pixel, attributes);
-            }
-        }
-        return result;
-    }
-
-    // Desenha só a parte visível do fundo (rápido, mesmo com muitos controles translúcidos).
-    public static void DrawBackdrop(Graphics graphics, Bitmap image, Color fallback)
-    {
-        RectangleF clip = graphics.VisibleClipBounds;
-        Rectangle area = Rectangle.Intersect(
-            new Rectangle((int)Math.Floor(clip.X) - 1, (int)Math.Floor(clip.Y) - 1, (int)Math.Ceiling(clip.Width) + 3, (int)Math.Ceiling(clip.Height) + 3),
-            new Rectangle(0, 0, image.Width, image.Height));
-        if (area.Width <= 0 || area.Height <= 0) { graphics.Clear(fallback); return; }
-        InterpolationMode interpolation = graphics.InterpolationMode;
-        graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
-        graphics.DrawImage(image, area, area, GraphicsUnit.Pixel);
-        graphics.InterpolationMode = interpolation;
-    }
-
-    private static void DrawBlob(Graphics g, float cx, float cy, float radius, Color color)
-    {
-        using (GraphicsPath path = new GraphicsPath())
-        {
-            path.AddEllipse(cx - radius, cy - radius, radius * 2, radius * 2);
-            using (PathGradientBrush brush = new PathGradientBrush(path))
-            {
-                brush.CenterPoint = new PointF(cx, cy);
-                brush.CenterColor = color;
-                brush.SurroundColors = new Color[] { Color.FromArgb(0, color) };
-                Blend blend = new Blend();
-                blend.Positions = new float[] { 0f, 0.2f, 0.4f, 0.6f, 0.8f, 1f };
-                blend.Factors = new float[] { 0f, 0.1f, 0.32f, 0.62f, 0.88f, 1f };
-                brush.Blend = blend;
-                g.FillPath(brush, path);
-            }
-        }
+        return new Font("Segoe UI", size, FontStyle.Bold);
     }
 }
 
-internal sealed class RoundedPanel : Panel, IGlassSurface
+internal static class Shapes
+{
+    internal static GraphicsPath Round(RectangleF r, float radius)
+    {
+        GraphicsPath path = new GraphicsPath();
+        float d = Math.Max(1f, Math.Min(radius * 2, Math.Min(r.Width, r.Height)));
+        if (r.Width < 1 || r.Height < 1) { path.AddRectangle(r); return path; }
+        path.AddArc(r.X, r.Y, d, d, 180, 90);
+        path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
+    internal static void Smooth(Graphics g)
+    {
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.CompositingQuality = CompositingQuality.HighQuality;
+    }
+
+    internal static Color ParentBack(Control control)
+    {
+        Control parent = control.Parent;
+        while (parent != null && parent.BackColor.A < 255) parent = parent.Parent;
+        return parent == null ? Theme.Bg : parent.BackColor;
+    }
+}
+
+internal sealed class RoundedPanel : Panel
 {
     private readonly int radius;
+    private readonly AnimatedValue focus;
     public Color BorderColor { get; set; }
-    // 255 = sólido (como antes). Menor que 255 = card de vidro: o fundo borrado da janela aparece através dele.
-    public int GlassAlpha { get; set; }
+    // Campos de texto/listas: a borda acende na cor de destaque quando o campo está em foco (como no ForeverNote).
+    public bool FocusRing { get; set; }
+    // Card com uma sombra leve embaixo.
+    public bool Elevated { get; set; }
 
     public RoundedPanel(int cornerRadius)
     {
         radius = cornerRadius;
         BorderColor = Color.Transparent;
-        GlassAlpha = 255;
+        focus = new AnimatedValue(this, 0);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        Enter += delegate { if (FocusRing) focus.AnimateTo(1, 200); };
+        Leave += delegate { if (FocusRing) focus.AnimateTo(0, 240); };
+    }
+
+    internal static GraphicsPath MakePath(Rectangle rectangle, int cornerRadius)
+    {
+        return Shapes.Round(rectangle, cornerRadius);
+    }
+
+    private RectangleF Body
+    {
+        get { return Elevated ? new RectangleF(0.5f, 0.5f, Width - 2f, Height - 3.5f) : new RectangleF(0.5f, 0.5f, Width - 2f, Height - 2f); }
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        PaintGlass(e.Graphics);
-    }
-
-    public void PaintGlass(Graphics graphics)
-    {
-        Glass.PaintBehind(this, graphics);
-        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        graphics.CompositingQuality = CompositingQuality.HighQuality;
-        using (GraphicsPath path = MakePath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
-        using (SolidBrush brush = new SolidBrush(Color.FromArgb(Math.Max(0, Math.Min(255, GlassAlpha)), BackColor))) graphics.FillPath(brush, path);
+        Graphics g = e.Graphics;
+        g.Clear(Shapes.ParentBack(this));
+        Shapes.Smooth(g);
+        RectangleF body = Body;
+        if (Elevated)
+        {
+            for (int i = 2; i >= 1; i--)
+            {
+                RectangleF shadow = new RectangleF(body.X, body.Y + i, body.Width, body.Height);
+                using (GraphicsPath path = Shapes.Round(shadow, radius))
+                using (SolidBrush brush = new SolidBrush(Color.FromArgb(Theme.Dark ? 60 : 12 + 6 * (2 - i), 10, 14, 30))) g.FillPath(brush, path);
+            }
+        }
+        using (GraphicsPath path = Shapes.Round(body, radius))
+        using (SolidBrush brush = new SolidBrush(BackColor)) g.FillPath(brush, path);
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        if (BorderColor.A == 0) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using (GraphicsPath path = MakePath(new Rectangle(0, 0, Width - 1, Height - 1), radius))
-        using (Pen pen = new Pen(BorderColor)) e.Graphics.DrawPath(pen, path);
-    }
-
-    internal static GraphicsPath MakePath(Rectangle rectangle, int cornerRadius)
-    {
-        GraphicsPath path = new GraphicsPath();
-        int diameter = Math.Max(2, cornerRadius * 2);
-        path.AddArc(rectangle.X, rectangle.Y, diameter, diameter, 180, 90);
-        path.AddArc(rectangle.Right - diameter, rectangle.Y, diameter, diameter, 270, 90);
-        path.AddArc(rectangle.Right - diameter, rectangle.Bottom - diameter, diameter, diameter, 0, 90);
-        path.AddArc(rectangle.X, rectangle.Bottom - diameter, diameter, diameter, 90, 90);
-        path.CloseFigure();
-        return path;
+        Graphics g = e.Graphics;
+        Shapes.Smooth(g);
+        RectangleF body = Body;
+        double f = focus.Value;
+        Color border = f > 0 ? Motion.Mix(BorderColor.A == 0 ? BackColor : BorderColor, Theme.Accent, f) : BorderColor;
+        if (border.A > 0)
+        {
+            using (GraphicsPath path = Shapes.Round(body, radius))
+            using (Pen pen = new Pen(border, 1f)) g.DrawPath(pen, path);
+        }
+        if (f > 0.01)
+        {
+            RectangleF inner = RectangleF.Inflate(body, -1.5f, -1.5f);
+            using (GraphicsPath path = Shapes.Round(inner, Math.Max(2, radius - 1)))
+            using (Pen pen = new Pen(Color.FromArgb((int)(70 * f), Theme.Accent), 2f)) g.DrawPath(pen, path);
+        }
     }
 }
+
+internal enum ButtonLook { Normal, Primary, Ghost }
 
 internal sealed class RoundedButton : Control
 {
     private readonly int radius;
-    private bool isHovering;
     private bool isPressed;
-    private double hoverAmount;
-    private double pressAmount;
-    private readonly object hoverMotion = new object();
-    private readonly object pressMotion = new object();
+    private readonly AnimatedValue hover;
+    private readonly AnimatedValue press;
+    private readonly AnimatedValue enabledness;
+    private ButtonLook look = ButtonLook.Normal;
     public Color BorderColor { get; set; }
-    public int GlassAlpha { get; set; }
+    // Cor do texto quando a cor de fundo muda ao passar o mouse (botões fantasmas).
+    public Color HoverForeColor { get; set; }
+    public ButtonLook Look
+    {
+        get { return look; }
+        set { look = value; Invalidate(); }
+    }
 
     public RoundedButton(int cornerRadius)
     {
         radius = cornerRadius;
         BorderColor = Color.Transparent;
-        GlassAlpha = 255;
+        HoverForeColor = Color.Empty;
         Cursor = Cursors.Hand;
         TabStop = true;
+        hover = new AnimatedValue(this, 0);
+        press = new AnimatedValue(this, 0);
+        enabledness = new AnimatedValue(this, 1);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint |
-            ControlStyles.ResizeRedraw | ControlStyles.StandardClick, true);
+            ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
         SetStyle(ControlStyles.StandardClick, false);
     }
+
+    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
 
     protected override bool IsInputKey(Keys keyData)
     {
@@ -461,284 +470,788 @@ internal sealed class RoundedButton : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        Glass.PaintBehind(this, e.Graphics);
+        e.Graphics.Clear(Shapes.ParentBack(this));
+    }
+
+    private RectangleF Body
+    {
+        get
+        {
+            // O botão principal tem um "brilho" colorido embaixo, então o corpo fica um pouco recuado.
+            if (look == ButtonLook.Primary) return new RectangleF(3.5f, 1.5f, Width - 8f, Height - 8f);
+            return new RectangleF(0.5f, 0.5f, Width - 2f, Height - 2f);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        if (Width < 2 || Height < 2) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
-        Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-        Color fill = BackColor;
-        int alpha = Math.Max(0, Math.Min(255, GlassAlpha));
-        if (!Enabled) fill = Blend(fill, Parent == null ? SystemColors.Control : Parent.BackColor, 0.5);
+        if (Width < 4 || Height < 4) return;
+        Graphics g = e.Graphics;
+        Shapes.Smooth(g);
+        Color under = Shapes.ParentBack(this);
+        double h = hover.Value;
+        double p = press.Value;
+        double en = enabledness.Value;
+        RectangleF body = Body;
+        // Ao clicar, o botão "afunda" levemente (scale .97).
+        float shrink = (float)(p * Math.Min(body.Width, body.Height) * 0.03 + p * 0.6);
+        body = RectangleF.Inflate(body, -shrink, -shrink * 0.8f);
+
+        Color fill;
+        Color text = ForeColor;
+        if (look == ButtonLook.Ghost)
+        {
+            Color baseFill = BackColor.A == 0 ? under : BackColor;
+            fill = Motion.Mix(Motion.Mix(under, Theme.Hover(baseFill), h), Theme.Press(baseFill), p);
+            if (HoverForeColor != Color.Empty) text = Motion.Mix(ForeColor, HoverForeColor, h);
+        }
+        else if (look == ButtonLook.Primary)
+        {
+            fill = Motion.Mix(Motion.Mix(BackColor, Theme.AccentHi, h), Motion.Mix(Theme.AccentHi, Color.Black, 0.08), p);
+        }
         else
         {
-            // Hover e clique mudam a cor suavemente (animados), e o vidro fica um pouco mais denso no hover.
-            if (hoverAmount > 0) fill = Blend(fill, Color.White, 0.08 * hoverAmount);
-            if (pressAmount > 0) fill = Blend(fill, Color.Black, 0.12 * pressAmount);
-            if (alpha < 255) alpha = Math.Min(255, alpha + (int)(45 * hoverAmount));
+            fill = Motion.Mix(Motion.Mix(BackColor, Theme.Hover(BackColor), h), Theme.Press(BackColor), p);
         }
-        using (GraphicsPath path = RoundedPanel.MakePath(bounds, radius))
-        using (SolidBrush brush = new SolidBrush(Color.FromArgb(alpha, fill))) e.Graphics.FillPath(brush, path);
-        if (BorderColor.A > 0)
+        Color disabledFill = Motion.Mix(BackColor.A == 0 ? under : BackColor, under, look == ButtonLook.Primary ? 0.55 : 0.35);
+        fill = Motion.Mix(disabledFill, fill, en);
+        text = Motion.Mix(Motion.Mix(text, under, 0.6), text, en);
+
+        if (look == ButtonLook.Primary && en > 0.05)
         {
-            using (GraphicsPath path = RoundedPanel.MakePath(bounds, radius))
-            using (Pen pen = new Pen(BorderColor)) e.Graphics.DrawPath(pen, path);
+            // Sombra colorida suave (box-shadow: 0 4px 14px -6px accent).
+            for (int i = 4; i >= 1; i--)
+            {
+                RectangleF glow = new RectangleF(body.X + 4 - i, body.Y + 3 + i, body.Width - 8 + 2 * i, body.Height - 2);
+                using (GraphicsPath path = Shapes.Round(glow, radius + i))
+                using (SolidBrush brush = new SolidBrush(Color.FromArgb((int)((10 + 6 * h) * en), BackColor))) g.FillPath(brush, path);
+            }
         }
-        Color textColor = Enabled ? ForeColor : Blend(ForeColor, Parent == null ? SystemColors.Control : Parent.BackColor, 0.6);
-        TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, textColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        if (fill.A > 0)
+        {
+            using (GraphicsPath path = Shapes.Round(body, radius))
+            using (SolidBrush brush = new SolidBrush(fill)) g.FillPath(brush, path);
+        }
+        Color border = BorderColor;
+        if (look == ButtonLook.Normal && border.A > 0) border = Motion.Mix(border, Theme.Faint, h * 0.6);
+        if (border.A > 0 && look != ButtonLook.Primary)
+        {
+            using (GraphicsPath path = Shapes.Round(body, radius))
+            using (Pen pen = new Pen(Motion.Mix(Motion.Mix(border, under, 0.5), border, en))) g.DrawPath(pen, path);
+        }
         if (Focused && ShowFocusCues)
         {
-            Rectangle focus = Rectangle.Inflate(ClientRectangle, -5, -5);
-            ControlPaint.DrawFocusRectangle(e.Graphics, focus, ForeColor, fill);
+            RectangleF ring = RectangleF.Inflate(body, -1.5f, -1.5f);
+            using (GraphicsPath path = Shapes.Round(ring, Math.Max(2, radius - 1)))
+            using (Pen pen = new Pen(Color.FromArgb(150, Theme.Accent), 2f)) g.DrawPath(pen, path);
         }
+        Rectangle textBounds = Rectangle.Round(body);
+        TextRenderer.DrawText(g, Text, Font, textBounds, text,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
     }
 
-    private void AnimateHover(bool on)
-    {
-        double from = hoverAmount;
-        double to = on ? 1 : 0;
-        Motion.Run(hoverMotion, on ? 140 : 220, delegate(double t)
-        {
-            hoverAmount = from + (to - from) * t;
-            if (!IsDisposed) Invalidate();
-        }, null);
-    }
-
-    private void AnimatePress(bool on)
-    {
-        double from = pressAmount;
-        double to = on ? 1 : 0;
-        // Afundar é quase instantâneo (resposta imediata ao clique); soltar é um pouco mais lento.
-        Motion.Run(pressMotion, on ? 60 : 200, delegate(double t)
-        {
-            pressAmount = from + (to - from) * t;
-            if (!IsDisposed) Invalidate();
-        }, null);
-    }
-
-    protected override void OnMouseEnter(EventArgs e) { isHovering = true; AnimateHover(true); base.OnMouseEnter(e); }
+    protected override void OnMouseEnter(EventArgs e) { hover.AnimateTo(1, 160); base.OnMouseEnter(e); }
     protected override void OnMouseLeave(EventArgs e)
     {
-        isHovering = false;
-        AnimateHover(false);
-        if (isPressed) { isPressed = false; AnimatePress(false); }
+        isPressed = false;
+        hover.AnimateTo(0, 260);
+        press.AnimateTo(0, 160);
         base.OnMouseLeave(e);
     }
     protected override void OnMouseDown(MouseEventArgs e)
     {
-        if (e.Button == MouseButtons.Left && Enabled) { isPressed = true; Focus(); Capture = true; AnimatePress(true); }
-        Invalidate();
+        if (e.Button == MouseButtons.Left && Enabled) { isPressed = true; Focus(); Capture = true; press.AnimateTo(1, 90); }
         base.OnMouseDown(e);
     }
     protected override void OnMouseUp(MouseEventArgs e)
     {
         bool activate = isPressed && e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location) && Enabled;
-        if (isPressed) AnimatePress(false);
         isPressed = false;
         Capture = false;
-        Invalidate();
+        press.AnimateTo(0, 320, Motion.Spring);
         base.OnMouseUp(e);
         if (activate) OnClick(EventArgs.Empty);
     }
     protected override void OnKeyDown(KeyEventArgs e)
     {
-        if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled) { isPressed = true; AnimatePress(true); e.Handled = true; }
+        if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled) { isPressed = true; press.AnimateTo(1, 90); e.Handled = true; }
         base.OnKeyDown(e);
     }
     protected override void OnKeyUp(KeyEventArgs e)
     {
         bool activate = isPressed && (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && Enabled;
-        if (isPressed) AnimatePress(false);
         isPressed = false;
-        Invalidate();
+        press.AnimateTo(0, 320, Motion.Spring);
         base.OnKeyUp(e);
         if (activate) OnClick(EventArgs.Empty);
     }
-    protected override void OnVisibleChanged(EventArgs e)
+    protected override void OnEnabledChanged(EventArgs e)
     {
-        // Botão escondido não pode ficar "preso" no hover.
-        if (!Visible) { isHovering = false; isPressed = false; Motion.Stop(hoverMotion); Motion.Stop(pressMotion); hoverAmount = 0; pressAmount = 0; }
-        base.OnVisibleChanged(e);
+        if (IsHandleCreated && Visible) enabledness.AnimateTo(Enabled ? 1 : 0, 220);
+        else { enabledness.Set(Enabled ? 1 : 0); Invalidate(); }
+        if (!Enabled) { hover.Set(0); press.Set(0); }
+        base.OnEnabledChanged(e);
     }
-    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
-    protected override void OnTextChanged(EventArgs e) { Invalidate(); base.OnTextChanged(e); }
-
-    private static Color Blend(Color foreground, Color background, double amount)
-    {
-        return Color.FromArgb(
-            (int)(foreground.R + (background.R - foreground.R) * amount),
-            (int)(foreground.G + (background.G - foreground.G) * amount),
-            (int)(foreground.B + (background.B - foreground.B) * amount));
-    }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
 }
 
 internal sealed class RoundedThumbnail : Control
 {
     private Image image;
-    public Image Image
-    {
-        get { return image; }
-        set { image = value; Invalidate(); }
-    }
+    private Image previous;
+    private readonly AnimatedValue reveal;
+    private bool loading;
+    private double shimmer;
+    private readonly object shimmerKey = new object();
     public Color PlaceholderColor { get; set; }
     public Color PlaceholderTextColor { get; set; }
     public string PlaceholderText { get; set; }
     public float PlaceholderFontSize { get; set; }
+    public int Radius { get; set; }
+
+    // Troca de imagem com fade cruzado.
+    public Image Image
+    {
+        get { return image; }
+        set
+        {
+            if (image == value) return;
+            previous = image;
+            image = value;
+            if (value != null && IsHandleCreated && Visible) { reveal.Set(0); reveal.AnimateTo(1, 380); }
+            else reveal.Set(1);
+            Invalidate();
+        }
+    }
+
+    // Enquanto carrega, mostra um "esqueleto" com brilho passando.
+    public bool Loading
+    {
+        get { return loading; }
+        set
+        {
+            if (loading == value) return;
+            loading = value;
+            if (loading)
+                Motion.Loop(shimmerKey, 1300, delegate(double t) { shimmer = t; if (!IsDisposed) Invalidate(); else Motion.Stop(shimmerKey); });
+            else Motion.Stop(shimmerKey);
+            Invalidate();
+        }
+    }
 
     public RoundedThumbnail()
     {
-        PlaceholderText = "YT";
-        PlaceholderFontSize = 17F;
         PlaceholderColor = Color.FromArgb(55, 55, 55);
         PlaceholderTextColor = Color.Gainsboro;
+        PlaceholderText = "";
+        PlaceholderFontSize = 17F;
+        Radius = 10;
+        reveal = new AnimatedValue(this, 1);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        Motion.Stop(shimmerKey);
+        base.Dispose(disposing);
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        Glass.PaintBehind(this, e.Graphics);
+        e.Graphics.Clear(Shapes.ParentBack(this));
+    }
+
+    private void DrawFitted(Graphics g, Image picture, float alpha)
+    {
+        // Preenche o quadro (corta as bordas) para ficar como uma capa de verdade.
+        float scale = Math.Max((float)Width / picture.Width, (float)Height / picture.Height);
+        float w = picture.Width * scale;
+        float h = picture.Height * scale;
+        RectangleF dest = new RectangleF((Width - w) / 2f, (Height - h) / 2f, w, h);
+        if (alpha >= 0.999f) { g.DrawImage(picture, dest); return; }
+        using (System.Drawing.Imaging.ImageAttributes attributes = new System.Drawing.Imaging.ImageAttributes())
+        {
+            System.Drawing.Imaging.ColorMatrix matrix = new System.Drawing.Imaging.ColorMatrix();
+            matrix.Matrix33 = alpha;
+            attributes.SetColorMatrix(matrix);
+            g.DrawImage(picture, new PointF[] { dest.Location, new PointF(dest.Right, dest.Top), new PointF(dest.Left, dest.Bottom) },
+                new RectangleF(0, 0, picture.Width, picture.Height), GraphicsUnit.Pixel, attributes);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         if (Width < 2 || Height < 2) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        Rectangle bounds = new Rectangle(0, 0, Width - 1, Height - 1);
-        using (GraphicsPath path = RoundedPanel.MakePath(bounds, 9))
+        Graphics g = e.Graphics;
+        Shapes.Smooth(g);
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        RectangleF bounds = new RectangleF(0, 0, Width - 1, Height - 1);
+        using (GraphicsPath path = Shapes.Round(bounds, Radius))
         {
-            e.Graphics.SetClip(path);
-            using (SolidBrush brush = new SolidBrush(PlaceholderColor)) e.Graphics.FillPath(brush, path);
+            g.SetClip(path);
+            using (SolidBrush brush = new SolidBrush(PlaceholderColor)) g.FillPath(brush, path);
+            float a = (float)Math.Max(0, Math.Min(1, reveal.Value));
+            try
+            {
+                if (previous != null && a < 1) DrawFitted(g, previous, 1 - a);
+            }
+            catch { previous = null; }
             if (image != null)
             {
-                float scale = Math.Min((float)Width / image.Width, (float)Height / image.Height);
-                int w = Math.Max(1, (int)(image.Width * scale));
-                int h = Math.Max(1, (int)(image.Height * scale));
-                e.Graphics.DrawImage(image, new Rectangle((Width - w) / 2, (Height - h) / 2, w, h));
+                try { DrawFitted(g, image, a); }
+                catch { }
             }
-            else
+            else if (loading)
+            {
+                float band = Width * 0.6f;
+                float x = (float)(-band + (Width + band * 2) * shimmer);
+                using (LinearGradientBrush shine = new LinearGradientBrush(new RectangleF(x - 1, 0, band + 2, Height), Color.Transparent, Color.Transparent, 0f))
+                {
+                    ColorBlend blend = new ColorBlend();
+                    Color glow = Color.FromArgb(Theme.Dark ? 28 : 120, Color.White);
+                    blend.Colors = new Color[] { Color.FromArgb(0, Color.White), glow, Color.FromArgb(0, Color.White) };
+                    blend.Positions = new float[] { 0f, 0.5f, 1f };
+                    shine.InterpolationColors = blend;
+                    g.FillRectangle(shine, x, 0, band, Height);
+                }
+            }
+            else if (!String.IsNullOrEmpty(PlaceholderText))
             {
                 using (Font font = new Font("Segoe UI", PlaceholderFontSize, FontStyle.Bold))
                 using (SolidBrush textBrush = new SolidBrush(PlaceholderTextColor))
                 using (StringFormat format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                    e.Graphics.DrawString(PlaceholderText ?? "", font, textBrush, bounds, format);
+                    g.DrawString(PlaceholderText, font, textBrush, bounds, format);
             }
+            if (a >= 1 && previous != null) previous = null;
         }
-        e.Graphics.ResetClip();
+        g.ResetClip();
     }
 }
 
 internal sealed class PercentBar : Control
 {
     private int value;
-    private double shownValue;
-    private readonly object valueMotion = new object();
-    private readonly Timer sheenTimer = new Timer();
-    private readonly Stopwatch sheenClock = Stopwatch.StartNew();
+    private readonly AnimatedValue shown;
+    private double sweep;
+    private bool active;
+    private readonly object sweepKey = new object();
     public Color TrackColor { get; set; }
     public Color FillColor { get; set; }
+
+    // O preenchimento desliza até o valor novo em vez de pular.
     public int Value
     {
         get { return value; }
         set
         {
-            int target = Math.Max(0, Math.Min(100, value));
-            if (target == this.value) { Invalidate(); return; }
-            this.value = target;
-            UpdateSheen();
-            if (target == 0)
-            {
-                // Volta para zero sem animação (nova fila / reinício).
-                Motion.Stop(valueMotion);
-                shownValue = 0;
-                Invalidate();
-                return;
-            }
-            // A barra desliza até o novo valor em vez de pular.
-            double from = shownValue;
-            Motion.Run(valueMotion, 350, delegate(double t)
-            {
-                shownValue = from + (target - from) * t;
-                if (!IsDisposed) Invalidate();
-            }, null);
+            int clamped = Math.Max(0, Math.Min(100, value));
+            if (clamped == this.value) return;
+            bool backwards = clamped < this.value;
+            this.value = clamped;
+            if (backwards || !IsHandleCreated || !Visible) { shown.Set(clamped); Invalidate(); }
+            else shown.AnimateTo(clamped, 420);
+        }
+    }
+
+    // Brilho passando pela barra enquanto o download está ativo.
+    public bool Active
+    {
+        get { return active; }
+        set
+        {
+            if (active == value) return;
+            active = value;
+            if (active) Motion.Loop(sweepKey, 1600, delegate(double t) { sweep = t; if (!IsDisposed) Invalidate(); else Motion.Stop(sweepKey); });
+            else { Motion.Stop(sweepKey); Invalidate(); }
         }
     }
 
     public PercentBar()
     {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         TrackColor = Color.FromArgb(226, 232, 240);
-        FillColor = Color.FromArgb(16, 185, 129);
-        sheenTimer.Interval = 30;
-        sheenTimer.Tick += delegate { if (Visible) Invalidate(); };
+        FillColor = Color.FromArgb(64, 103, 227);
+        shown = new AnimatedValue(this, 0);
     }
 
-    // Um brilho suave percorre a barra enquanto o download está em andamento.
-    private void UpdateSheen()
-    {
-        bool active = value > 0 && value < 100 && Visible && Motion.Enabled;
-        if (active && !sheenTimer.Enabled) sheenTimer.Start();
-        else if (!active && sheenTimer.Enabled) { sheenTimer.Stop(); Invalidate(); }
-    }
-
-    protected override void OnVisibleChanged(EventArgs e)
-    {
-        UpdateSheen();
-        base.OnVisibleChanged(e);
-    }
+    public double DisplayValue { get { return shown.Value; } }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { Motion.Stop(valueMotion); sheenTimer.Stop(); sheenTimer.Dispose(); }
+        Motion.Stop(sweepKey);
         base.Dispose(disposing);
     }
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        Glass.PaintBehind(this, e.Graphics);
+        e.Graphics.Clear(Shapes.ParentBack(this));
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         if (Width < 2 || Height < 2) return;
-        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        e.Graphics.CompositingQuality = CompositingQuality.HighQuality;
-        Rectangle track = new Rectangle(0, 1, Width - 1, Height - 2);
-        using (GraphicsPath trackPath = RoundedPanel.MakePath(track, Math.Max(1, track.Height / 2)))
-        using (SolidBrush trackBrush = new SolidBrush(TrackColor)) e.Graphics.FillPath(trackBrush, trackPath);
-        int fillWidth = (int)Math.Round((Width - 1) * shownValue / 100.0);
-        if (fillWidth > 0)
+        Graphics g = e.Graphics;
+        Shapes.Smooth(g);
+        RectangleF track = new RectangleF(0, 0.5f, Width - 1, Height - 1.5f);
+        float r = track.Height / 2f;
+        using (GraphicsPath trackPath = Shapes.Round(track, r))
+        using (SolidBrush trackBrush = new SolidBrush(TrackColor)) g.FillPath(trackBrush, trackPath);
+        float fillWidth = (float)((Width - 1) * shown.Value / 100.0);
+        if (fillWidth > 0.5f)
         {
-            Rectangle fill = new Rectangle(0, 1, Math.Max(1, fillWidth), Height - 2);
-            using (GraphicsPath fillPath = RoundedPanel.MakePath(fill, Math.Max(1, Math.Min(fill.Height, fill.Width) / 2)))
+            RectangleF fill = new RectangleF(0, 0.5f, Math.Max(track.Height, fillWidth), track.Height);
+            using (GraphicsPath fillPath = Shapes.Round(fill, r))
             {
-                using (SolidBrush fillBrush = new SolidBrush(FillColor)) e.Graphics.FillPath(fillBrush, fillPath);
-                if (sheenTimer.Enabled && fill.Width > 8)
+                using (LinearGradientBrush brush = new LinearGradientBrush(new RectangleF(fill.X - 1, 0, fill.Width + 2, Height),
+                    Motion.Mix(FillColor, Color.White, Theme.Dark ? 0.0 : 0.12), Motion.Mix(FillColor, Theme.Dark ? Color.White : Color.Black, Theme.Dark ? 0.12 : 0.06), 0f))
+                    g.FillPath(brush, fillPath);
+                if (active)
                 {
-                    const int band = 90;
-                    int travel = fill.Width + band * 2;
-                    int x = (int)(sheenClock.ElapsedMilliseconds * 0.28 % travel) - band;
-                    Rectangle sheen = new Rectangle(x, fill.Y, band, fill.Height);
-                    using (LinearGradientBrush brush = new LinearGradientBrush(new Rectangle(x - 1, fill.Y, band + 2, Math.Max(1, fill.Height)),
-                        Color.FromArgb(0, Color.White), Color.FromArgb(0, Color.White), LinearGradientMode.Horizontal))
+                    g.SetClip(fillPath);
+                    float band = Math.Max(60f, Width * 0.18f);
+                    float x = (float)(-band + (fill.Width + band) * sweep);
+                    using (LinearGradientBrush shine = new LinearGradientBrush(new RectangleF(x - 1, 0, band + 2, Height), Color.Transparent, Color.Transparent, 0f))
                     {
                         ColorBlend blend = new ColorBlend();
-                        blend.Colors = new Color[] { Color.FromArgb(0, Color.White), Color.FromArgb(90, Color.White), Color.FromArgb(0, Color.White) };
+                        blend.Colors = new Color[] { Color.FromArgb(0, Color.White), Color.FromArgb(95, Color.White), Color.FromArgb(0, Color.White) };
                         blend.Positions = new float[] { 0f, 0.5f, 1f };
-                        brush.InterpolationColors = blend;
-                        e.Graphics.SetClip(fillPath);
-                        e.Graphics.FillRectangle(brush, sheen);
-                        e.Graphics.ResetClip();
+                        shine.InterpolationColors = blend;
+                        g.FillRectangle(shine, x, 0, band, Height);
                     }
+                    g.ResetClip();
                 }
             }
         }
+    }
+}
+
+// Interruptor (liga/desliga) no lugar das caixinhas de marcar. Continua sendo um CheckBox por dentro.
+internal sealed class ToggleSwitch : CheckBox
+{
+    private readonly AnimatedValue knob;
+    private readonly AnimatedValue hover;
+    private const int TrackWidth = 34;
+    private const int TrackHeight = 20;
+
+    public ToggleSwitch()
+    {
+        knob = new AnimatedValue(this, 0);
+        hover = new AnimatedValue(this, 0);
+        Cursor = Cursors.Hand;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+    }
+
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        Size text = TextRenderer.MeasureText(Text, Font, Size.Empty, TextFormatFlags.NoPadding);
+        return new Size(TrackWidth + 8 + text.Width + 2, Math.Max(TrackHeight + 4, text.Height + 4));
+    }
+
+    protected override void OnCheckedChanged(EventArgs e)
+    {
+        if (IsHandleCreated && Visible) knob.AnimateTo(Checked ? 1 : 0, 340, Motion.Spring);
+        else { knob.Set(Checked ? 1 : 0); Invalidate(); }
+        base.OnCheckedChanged(e);
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover.AnimateTo(1, 160); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover.AnimateTo(0, 240); base.OnMouseLeave(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        Color under = Shapes.ParentBack(this);
+        g.Clear(under);
+        Shapes.Smooth(g);
+        double k = knob.Value;
+        double kc = Math.Max(0, Math.Min(1, k));
+        float top = (Height - TrackHeight) / 2f;
+        RectangleF track = new RectangleF(1, top, TrackWidth, TrackHeight);
+        Color off = Motion.Mix(Theme.LineStrong, Theme.Faint, hover.Value * 0.5);
+        Color on = Motion.Mix(Theme.Accent, Theme.AccentHi, hover.Value);
+        Color trackColor = Motion.Mix(off, on, kc);
+        if (!Enabled) trackColor = Motion.Mix(trackColor, under, 0.5);
+        using (GraphicsPath path = Shapes.Round(track, TrackHeight / 2f))
+        using (SolidBrush brush = new SolidBrush(trackColor)) g.FillPath(brush, path);
+        float d = TrackHeight - 6;
+        float x = (float)(track.X + 3 + (TrackWidth - 6 - d) * k);
+        // A bolinha "estica" um pouco enquanto anda.
+        float stretch = (float)(Math.Sin(Math.PI * kc) * 4 * (Motion.IsRunning(knob) ? 1 : 0));
+        RectangleF dot = new RectangleF(x - stretch / 2f, top + 3, d + stretch, d);
+        using (GraphicsPath shadowPath = Shapes.Round(new RectangleF(dot.X, dot.Y + 1, dot.Width, dot.Height), d / 2f))
+        using (SolidBrush shadow = new SolidBrush(Color.FromArgb(40, 0, 0, 0))) g.FillPath(shadow, shadowPath);
+        using (GraphicsPath dotPath = Shapes.Round(dot, d / 2f))
+        using (SolidBrush brush = new SolidBrush(Color.White)) g.FillPath(brush, dotPath);
+        Color text = Enabled ? ForeColor : Motion.Mix(ForeColor, under, 0.55);
+        Rectangle textRect = new Rectangle(TrackWidth + 9, 0, Width - TrackWidth - 9, Height);
+        TextRenderer.DrawText(g, Text, Font, textRect, text, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        if (Focused && ShowFocusCues)
+        {
+            using (GraphicsPath ring = Shapes.Round(RectangleF.Inflate(track, 1.5f, 1.5f), TrackHeight / 2f + 1.5f))
+            using (Pen pen = new Pen(Color.FromArgb(120, Theme.Accent), 2f)) g.DrawPath(pen, ring);
+        }
+    }
+}
+
+// Seletor em "pílulas" (Áudio | Vídeo | Vídeo + Áudio). A pílula desliza com efeito de mola.
+internal sealed class SegmentedControl : Control
+{
+    private string[] items = new string[0];
+    private int selectedIndex = -1;
+    private int hoverIndex = -1;
+    private readonly AnimatedValue pillX;
+    private readonly AnimatedValue pillW;
+    private readonly AnimatedValue appear;
+    public event EventHandler SelectedIndexChanged;
+    public Color TrackColor { get; set; }
+    public Color PillColor { get; set; }
+    public Color SelectedTextColor { get; set; }
+    public Color TextColor { get; set; }
+    public bool AccentPill { get; set; }
+    public int Radius { get; set; }
+
+    public SegmentedControl()
+    {
+        pillX = new AnimatedValue(this, 0);
+        pillW = new AnimatedValue(this, 0);
+        appear = new AnimatedValue(this, 0);
+        Radius = 10;
+        Cursor = Cursors.Hand;
+        TabStop = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint |
+            ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+    }
+
+    public string[] Items
+    {
+        get { return items; }
+        set
+        {
+            items = value ?? new string[0];
+            if (selectedIndex >= items.Length) selectedIndex = items.Length - 1;
+            SnapPill();
+            Invalidate();
+        }
+    }
+
+    public int SelectedIndex
+    {
+        get { return selectedIndex; }
+        set
+        {
+            if (value < -1 || value >= items.Length || value == selectedIndex) return;
+            selectedIndex = value;
+            RectangleF r = SegmentRect(value);
+            if (IsHandleCreated && Visible && appear.Value > 0.5)
+            {
+                pillX.AnimateTo(r.X, 380, Motion.Spring);
+                pillW.AnimateTo(r.Width, 380, Motion.Spring);
+            }
+            else SnapPill();
+            Invalidate();
+            if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+        }
+    }
+
+    public string SelectedItem { get { return selectedIndex >= 0 && selectedIndex < items.Length ? items[selectedIndex] : null; } }
+
+    private void SnapPill()
+    {
+        if (selectedIndex < 0) return;
+        RectangleF r = SegmentRect(selectedIndex);
+        pillX.Set(r.X);
+        pillW.Set(r.Width);
+        appear.Set(1);
+    }
+
+    protected override void OnResize(EventArgs e) { SnapPill(); base.OnResize(e); }
+    protected override void OnFontChanged(EventArgs e) { SnapPill(); base.OnFontChanged(e); }
+
+    // Larguras proporcionais ao texto, preenchendo toda a largura do controle.
+    private float[] Widths()
+    {
+        float[] widths = new float[items.Length];
+        if (items.Length == 0) return widths;
+        float total = 0;
+        for (int i = 0; i < items.Length; i++)
+        {
+            widths[i] = TextRenderer.MeasureText(items[i], Font, Size.Empty, TextFormatFlags.NoPadding).Width;
+            total += widths[i];
+        }
+        float inner = Width - 6;
+        float spare = Math.Max(0, inner - total) / items.Length;
+        for (int i = 0; i < items.Length; i++) widths[i] += spare;
+        float sum = 0;
+        foreach (float w in widths) sum += w;
+        if (sum > inner && sum > 0) for (int i = 0; i < items.Length; i++) widths[i] *= inner / sum;
+        return widths;
+    }
+
+    private RectangleF SegmentRect(int index)
+    {
+        float[] widths = Widths();
+        float x = 3;
+        for (int i = 0; i < index && i < widths.Length; i++) x += widths[i];
+        return new RectangleF(x, 3, index < widths.Length ? widths[index] : 0, Height - 7);
+    }
+
+    private int HitTest(Point point)
+    {
+        for (int i = 0; i < items.Length; i++)
+            if (SegmentRect(i).Contains(point)) return i;
+        return -1;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        int hit = HitTest(e.Location);
+        if (hit != hoverIndex) { hoverIndex = hit; Invalidate(); }
+        base.OnMouseMove(e);
+    }
+    protected override void OnMouseLeave(EventArgs e) { hoverIndex = -1; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && Enabled)
+        {
+            Focus();
+            int hit = HitTest(e.Location);
+            if (hit >= 0) SelectedIndex = hit;
+        }
+        base.OnMouseDown(e);
+    }
+    protected override bool IsInputKey(Keys keyData)
+    {
+        return keyData == Keys.Left || keyData == Keys.Right || base.IsInputKey(keyData);
+    }
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Left && selectedIndex > 0) SelectedIndex = selectedIndex - 1;
+        else if (e.KeyCode == Keys.Right && selectedIndex < items.Length - 1) SelectedIndex = selectedIndex + 1;
+        base.OnKeyDown(e);
+    }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        Color under = Shapes.ParentBack(this);
+        g.Clear(under);
+        Shapes.Smooth(g);
+        RectangleF outer = new RectangleF(0.5f, 0.5f, Width - 2f, Height - 2f);
+        using (GraphicsPath path = Shapes.Round(outer, Radius))
+        using (SolidBrush brush = new SolidBrush(TrackColor)) g.FillPath(brush, path);
+        for (int i = 0; i < items.Length; i++)
+        {
+            if (i != hoverIndex || i == selectedIndex || !Enabled) continue;
+            using (GraphicsPath path = Shapes.Round(SegmentRect(i), Radius - 3))
+            using (SolidBrush brush = new SolidBrush(Theme.Hover(TrackColor))) g.FillPath(brush, path);
+        }
+        if (selectedIndex >= 0)
+        {
+            RectangleF pill = new RectangleF((float)pillX.Value, 3, (float)Math.Max(4, pillW.Value), Height - 7);
+            Color pillColor = AccentPill ? Theme.Accent : PillColor;
+            if (!Enabled) pillColor = Motion.Mix(pillColor, TrackColor, 0.5);
+            using (GraphicsPath shadowPath = Shapes.Round(new RectangleF(pill.X, pill.Y + 1, pill.Width, pill.Height), Radius - 3))
+            using (SolidBrush shadow = new SolidBrush(Color.FromArgb(Theme.Dark ? 70 : 22, 10, 14, 30))) g.FillPath(shadow, shadowPath);
+            using (GraphicsPath path = Shapes.Round(pill, Radius - 3))
+            using (SolidBrush brush = new SolidBrush(pillColor)) g.FillPath(brush, path);
+            if (Focused && ShowFocusCues)
+                using (GraphicsPath path = Shapes.Round(RectangleF.Inflate(pill, -1, -1), Radius - 4))
+                using (Pen pen = new Pen(Color.FromArgb(150, Theme.Accent), 1.5f)) g.DrawPath(pen, path);
+        }
+        for (int i = 0; i < items.Length; i++)
+        {
+            RectangleF r = SegmentRect(i);
+            // A cor do texto acompanha a pílula enquanto ela passa por baixo.
+            double cover = 0;
+            if (selectedIndex >= 0)
+            {
+                double left = Math.Max(r.X, pillX.Value);
+                double right = Math.Min(r.Right, pillX.Value + pillW.Value);
+                cover = Math.Max(0, Math.Min(1, (right - left) / Math.Max(1, r.Width)));
+            }
+            Color selectedText = AccentPill ? Theme.OnAccent : SelectedTextColor;
+            Color color = Motion.Mix(TextColor, selectedText, cover);
+            if (!Enabled) color = Motion.Mix(color, under, 0.5);
+            TextRenderer.DrawText(g, items[i], Font, Rectangle.Round(r), color,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+        }
+    }
+}
+
+// Marca do app: quadrado arredondado com degradê e uma seta de download.
+internal sealed class BrandMark : Control
+{
+    private readonly AnimatedValue bounce;
+    public BrandMark()
+    {
+        bounce = new AnimatedValue(this, 0);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+    }
+
+    // A seta dá um pulinho (ex.: quando um download termina).
+    public void Bounce()
+    {
+        bounce.Set(0);
+        Motion.Run(this, 700, delegate(double t) { bounce.Value = Math.Sin(t * Math.PI * 2) * (1 - t); if (!IsDisposed) Invalidate(); }, null, Motion.Linear);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.Clear(Shapes.ParentBack(this));
+        Shapes.Smooth(g);
+        RectangleF box = new RectangleF(0.5f, 0.5f, Width - 2f, Height - 2f);
+        using (GraphicsPath path = Shapes.Round(box, Width * 0.28f))
+        using (LinearGradientBrush brush = new LinearGradientBrush(box, Motion.Mix(Theme.Accent, Color.White, 0.18), Motion.Mix(Theme.Accent, Color.FromArgb(120, 70, 230), 0.45), 45f))
+            g.FillPath(brush, path);
+        float s = Width / 32f;
+        float dy = (float)(bounce.Value * 3 * s);
+        Color ink = Theme.Dark ? Theme.OnAccent : Color.White;
+        using (Pen pen = new Pen(ink, 2.6f * s))
+        {
+            pen.StartCap = LineCap.Round;
+            pen.EndCap = LineCap.Round;
+            pen.LineJoin = LineJoin.Round;
+            g.DrawLine(pen, 16 * s, 8 * s + dy, 16 * s, 18.5f * s + dy);
+            g.DrawLines(pen, new PointF[] { new PointF(11 * s, 14 * s + dy), new PointF(16 * s, 19 * s + dy), new PointF(21 * s, 14 * s + dy) });
+            g.DrawLine(pen, 10 * s, 23.5f * s, 22 * s, 23.5f * s);
+        }
+    }
+}
+
+// Listas suspensas desenhadas com as cores do tema (a lista aberta também fica escura no modo escuro).
+internal static class ComboStyle
+{
+    private static readonly HashSet<ComboBox> styled = new HashSet<ComboBox>();
+
+    public static void Apply(ComboBox box)
+    {
+        if (styled.Contains(box) || box.DrawMode != DrawMode.Normal) return;
+        styled.Add(box);
+        box.DrawMode = DrawMode.OwnerDrawFixed;
+        box.ItemHeight = 20;
+        box.DrawItem += delegate(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0) return;
+            bool edit = (e.State & DrawItemState.ComboBoxEdit) != 0;
+            bool selected = (e.State & DrawItemState.Selected) != 0 && !edit;
+            Color back = box.BackColor;
+            Color fore = box.Enabled ? box.ForeColor : Motion.Mix(box.ForeColor, back, 0.5);
+            using (SolidBrush brush = new SolidBrush(selected ? Theme.AccentSoft : back)) e.Graphics.FillRectangle(brush, e.Bounds);
+            if (selected)
+            {
+                using (SolidBrush bar = new SolidBrush(Theme.Accent)) e.Graphics.FillRectangle(bar, e.Bounds.X, e.Bounds.Y + 4, 3, e.Bounds.Height - 8);
+                fore = Theme.Dark ? Theme.Fg : Theme.Accent;
+            }
+            Rectangle text = new Rectangle(e.Bounds.X + (edit ? 0 : 10), e.Bounds.Y, e.Bounds.Width - (edit ? 0 : 10), e.Bounds.Height);
+            TextRenderer.DrawText(e.Graphics, box.GetItemText(box.Items[e.Index]), box.Font, text, fore,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+        };
+        box.DropDownClosed += delegate { box.Invalidate(); };
+    }
+}
+
+// Pinta um formulário inteiro de uma vez a cada quadro (sem "piscar" ao mover vários controles).
+internal static class Redraw
+{
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    private static extern bool RedrawWindow(IntPtr hWnd, IntPtr rect, IntPtr region, int flags);
+
+    private static readonly bool windows = Environment.OSVersion.Platform == PlatformID.Win32NT;
+
+    public static void Suspend(Control control)
+    {
+        if (!windows || !control.IsHandleCreated) return;
+        try { SendMessage(control.Handle, 0x000B, IntPtr.Zero, IntPtr.Zero); }
+        catch { }
+    }
+
+    public static void Resume(Control control)
+    {
+        if (!control.IsHandleCreated) return;
+        if (!windows) { control.Invalidate(true); return; }
+        try
+        {
+            SendMessage(control.Handle, 0x000B, new IntPtr(1), IntPtr.Zero);
+            // RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+            RedrawWindow(control.Handle, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0080 | 0x0100);
+        }
+        catch { control.Invalidate(true); }
+    }
+}
+
+// Área tracejada "arraste aqui", que acende quando um arquivo é arrastado por cima.
+internal sealed class DropZone : Control
+{
+    private readonly AnimatedValue glow;
+    public string Glyph { get; set; }
+    public string Title { get; set; }
+    public string Hint { get; set; }
+
+    public DropZone()
+    {
+        glow = new AnimatedValue(this, 0);
+        Glyph = "⇪";
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        Cursor = Cursors.Hand;
+    }
+
+    public bool Highlighted
+    {
+        set { glow.AnimateTo(value ? 1 : 0, value ? 180 : 260); }
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { glow.AnimateTo(0.45, 180); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { glow.AnimateTo(0, 260); base.OnMouseLeave(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        Color under = Shapes.ParentBack(this);
+        g.Clear(under);
+        Shapes.Smooth(g);
+        double k = glow.Value;
+        RectangleF box = new RectangleF(1, 1, Width - 3, Height - 3);
+        using (GraphicsPath path = Shapes.Round(box, 14))
+        {
+            using (SolidBrush fill = new SolidBrush(Motion.Mix(Theme.Surface, Theme.AccentSoft, k))) g.FillPath(fill, path);
+            using (Pen pen = new Pen(Motion.Mix(Theme.LineStrong, Theme.Accent, k), 1.5f))
+            {
+                pen.DashStyle = DashStyle.Dash;
+                pen.DashPattern = new float[] { 4f, 3f };
+                g.DrawPath(pen, path);
+            }
+        }
+        float lift = (float)(k * 4);
+        float circle = 44;
+        RectangleF disc = new RectangleF((Width - circle) / 2f, Height / 2f - 46 - lift, circle, circle);
+        using (SolidBrush brush = new SolidBrush(Motion.Mix(Theme.AccentSoft, Theme.Accent, k * 0.25))) g.FillEllipse(brush, disc);
+        TextRenderer.DrawText(g, Glyph, new Font("Segoe UI", 15F), Rectangle.Round(disc), Theme.Accent,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        using (Font titleFont = Theme.Semibold(10.5F))
+            TextRenderer.DrawText(g, Title ?? "", titleFont, new Rectangle(0, (int)(Height / 2f + 6), Width, 22), Theme.Fg,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.NoPadding);
+        TextRenderer.DrawText(g, Hint ?? "", Font, new Rectangle(0, (int)(Height / 2f + 30), Width, 20), Theme.Muted,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.Top | TextFormatFlags.NoPadding);
+    }
+}
+
+internal static class Buffering
+{
+    public static void Enable(Control control)
+    {
+        try
+        {
+            typeof(Control).GetProperty("DoubleBuffered", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(control, true, null);
+        }
+        catch { }
     }
 }
 
@@ -878,7 +1391,7 @@ internal sealed class TimeRangeSlider : Control
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
             ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
-        HighlightColor = Color.FromArgb(16, 185, 129);
+        HighlightColor = Theme.Accent;
         TrackColor = Color.FromArgb(203, 213, 225);
         WaveBackColor = Color.FromArgb(248, 250, 252);
         StatusTextColor = Color.FromArgb(100, 116, 139);
@@ -1140,7 +1653,7 @@ internal sealed class TimeRangeSlider : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        Glass.PaintBehind(this, e.Graphics);
+        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
     }
 
     private double FadeGain(double t)
@@ -1371,7 +1884,7 @@ internal sealed class VolumeControl : Control
         Cursor = Cursors.Hand;
         IconColor = Color.FromArgb(100, 116, 139);
         TrackColor = Color.FromArgb(203, 213, 225);
-        AccentColor = Color.FromArgb(16, 185, 129);
+        AccentColor = Theme.Accent;
     }
 
     private int TrackLeft { get { return IconWidth + 6; } }
@@ -1387,7 +1900,7 @@ internal sealed class VolumeControl : Control
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        Glass.PaintBehind(this, e.Graphics);
+        e.Graphics.Clear(Parent == null ? SystemColors.Control : Parent.BackColor);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -1668,10 +2181,20 @@ internal sealed class DownloadJob
     public double SectionSeconds;
 }
 
-internal sealed class DownloaderForm : Form, IGlassSurface
+internal sealed class DownloaderForm : Form
 {
-    internal const string AppVersion = "5.0";
+    internal const string AppVersion = "6.0";
     private readonly Label versionLabel = new Label();
+    private readonly BrandMark brandMark = new BrandMark();
+    private readonly SegmentedControl typeSwitch = new SegmentedControl();
+    // "Baixar ao colar": cola o link e o download começa sozinho assim que o vídeo é identificado.
+    private readonly CheckBox autoDownloadCheckBox = new ToggleSwitch();
+    private bool autoDownloadArmed;
+    // Animações de layout: 0 = escondido, 1 = visível (a prévia e o painel de corte "abrem" suavemente).
+    private double previewReveal = 1;
+    private double trimReveal;
+    private readonly object previewRevealKey = new object();
+    private readonly object trimRevealKey = new object();
     private readonly QueueTextBox urlBox = new QueueTextBox();
     private readonly RoundedPanel urlSurface = new RoundedPanel(10);
     private readonly ComboBox typeBox = new ComboBox();
@@ -1715,12 +2238,12 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private int queueFailed;
     private string queueDestination;
     private string queueFormat;
-    private bool darkMode;
+    private bool darkMode { get { return Theme.Dark; } set { Theme.Dark = value; } }
     private bool isDownloading;
     private bool suppressBatchCountAfterReset;
     private bool previewShown = true;
     private readonly RoundedPanel trimPanel = new RoundedPanel(12);
-    private readonly CheckBox trimCheckBox = new CheckBox();
+    private readonly CheckBox trimCheckBox = new ToggleSwitch();
     private readonly TimeRangeSlider timeRangeSlider = new TimeRangeSlider();
     private readonly Label trimStartLabel = new Label();
     private readonly Label trimEndLabel = new Label();
@@ -1738,7 +2261,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private readonly List<string> failedLinks = new List<string>();
     private readonly Timer jobProgressTimer = new Timer();
     private bool queueNormalize;
-    private readonly CheckBox normalizeCheckBox = new CheckBox();
+    private readonly CheckBox normalizeCheckBox = new ToggleSwitch();
     private readonly Dictionary<string, double[]> trimFades = new Dictionary<string, double[]>(StringComparer.OrdinalIgnoreCase);
     private readonly RoundedPanel trimStartSurface = new RoundedPanel(8);
     private readonly RoundedPanel trimEndSurface = new RoundedPanel(8);
@@ -1764,7 +2287,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private readonly RoundedButton addSegmentButton = new RoundedButton(10);
     private readonly RoundedButton clipboardButton = new RoundedButton(10);
     private readonly RoundedButton localFileButton = new RoundedButton(10);
-    private readonly CheckBox subtitlesCheckBox = new CheckBox();
+    private readonly CheckBox subtitlesCheckBox = new ToggleSwitch();
     private readonly List<JobSpec> jobSpecs = new List<JobSpec>();
     private readonly List<JobSpec> failedSpecs = new List<JobSpec>();
     private List<JobSpec> pendingRetrySpecs;
@@ -1781,13 +2304,6 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private readonly Timer toastTimer = new Timer();
     private string toastRevealPath;
     private Action toastAction;
-    private readonly object toastMotion = new object();
-    private readonly object resizeMotion = new object();
-    private readonly object themeMotion = new object();
-    private readonly object windowMotion = new object();
-    private int resizeTarget = -1;
-    private Bitmap backdrop;
-    private bool backdropDark;
     private readonly Label sizeEstimateLabel = new Label();
     private readonly RoundedButton converterButton = new RoundedButton(12);
     private readonly Timer estimateTimer = new Timer();
@@ -1803,7 +2319,6 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     public DownloaderForm()
     {
         Text = "YT Downloader - by revmpt  ·  v" + AppVersion;
-        DoubleBuffered = true;
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(720, 560);
@@ -1813,16 +2328,23 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         Font = new Font("Segoe UI", 9F);
         darkMode = ReadWindowsTheme();
 
+        DoubleBuffered = true;
+        brandMark.SetBounds(28, 18, 34, 34);
+        brandMark.Cursor = Cursors.Hand;
+        brandMark.Click += delegate { brandMark.Bounce(); };
+        Controls.Add(brandMark);
+
         titleLabel.Text = "YT Downloader";
-        titleLabel.Font = new Font("Segoe UI", 21F, FontStyle.Bold);
+        titleLabel.Font = Theme.Semibold(15F);
         titleLabel.AutoSize = true;
-        titleLabel.Location = new Point(28, 20);
+        titleLabel.Location = new Point(70, 14);
         Controls.Add(titleLabel);
 
         versionLabel.Text = "v" + AppVersion;
-        versionLabel.Font = new Font("Segoe UI", 9F);
+        versionLabel.Text = "by revmpt  ·  v" + AppVersion;
+        versionLabel.Font = new Font("Segoe UI", 8.25F);
         versionLabel.AutoSize = true;
-        versionLabel.Location = new Point(28 + titleLabel.PreferredWidth + 2, 37);
+        versionLabel.Location = new Point(72, 38);
         Controls.Add(versionLabel);
 
         subtitleLabel.Text = "";
@@ -1832,22 +2354,23 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         subtitleLabel.Visible = false;
         Controls.Add(subtitleLabel);
 
-        themeButton.SetBounds(652, 26, 40, 34);
+        themeButton.SetBounds(652, 17, 40, 34);
         themeButton.Cursor = Cursors.Hand;
-        themeButton.Click += delegate { ToggleThemeAnimated(); };
+        themeButton.Click += delegate { SwitchThemeAnimated(); };
         Controls.Add(themeButton);
 
-        historyButton.Text = "Downloads";
-        historyButton.SetBounds(534, 26, 110, 34);
+        foreach (RoundedButton ghost in new RoundedButton[] { themeButton, historyButton, updateButton, converterButton }) ghost.Look = ButtonLook.Ghost;
+        historyButton.Text = "↓  Downloads";
+        historyButton.SetBounds(534, 17, 110, 34);
         historyButton.Cursor = Cursors.Hand;
         historyButton.Click += ShowDownloadHistory;
         Controls.Add(historyButton);
 
         updateButton.Text = "↻  Atualizar";
-        updateButton.SetBounds(422, 26, 104, 34);
+        updateButton.SetBounds(422, 17, 104, 34);
 
         converterButton.Text = "⇄  Converter";
-        converterButton.SetBounds(310, 26, 104, 34);
+        converterButton.SetBounds(310, 17, 104, 34);
         converterButton.Click += ShowConverter;
         Controls.Add(converterButton);
         musicStatusTip.SetToolTip(converterButton, "Converter vídeos, músicas e imagens do seu PC (MKV → MP4, JPG → PNG, MP3 → AAC…)");
@@ -1871,6 +2394,13 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             string folder = folderBox.Text.Trim();
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
+                // "Aquece" o motor de download: o primeiro link colado é identificado mais rápido.
+                try
+                {
+                    bool warmed;
+                    RunTool(Program.YtDlpPath, "--version", 15000, out warmed, null);
+                }
+                catch { }
                 CleanupOldRuntimes();
                 CleanupLeftoverTempFolders(folder);
                 System.Threading.Thread.Sleep(2500);
@@ -1917,18 +2447,8 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         // Minimizar durante um download: o app vai para perto do relógio e continua baixando.
         Resize += delegate { if (WindowState == FormWindowState.Minimized && isDownloading && Visible) MinimizeToTray(); };
         Activated += delegate { CheckClipboardForLinks(); };
-        if (Motion.Enabled) Opacity = 0;
-        Shown += delegate
-        {
-            // Abre com fade e sobe alguns pixels, de forma suave.
-            int finalTop = Top;
-            Top = finalTop + 14;
-            Motion.Run(windowMotion, 320, delegate(double t)
-            {
-                Opacity = t;
-                Top = finalTop + (int)Math.Round(14 * (1 - t));
-            }, delegate { Opacity = 1; Top = finalTop; });
-        };
+        // Abre com fade e sobe alguns pixels.
+        Motion.FadeIn(this);
         Shown += delegate
         {
             try
@@ -1948,6 +2468,22 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             CheckClipboardForLinks();
             EnsureShortcuts();
         };
+
+        autoDownloadCheckBox.Text = "Baixar ao colar";
+        autoDownloadCheckBox.Font = new Font("Segoe UI", 8.5F);
+        autoDownloadCheckBox.AutoSize = true;
+        autoDownloadCheckBox.Location = new Point(692 - autoDownloadCheckBox.PreferredSize.Width, 57);
+        autoDownloadCheckBox.CheckedChanged += delegate
+        {
+            if (!Visible) return;
+            Dictionary<string, string> settings = ReadSettings();
+            settings["auto-download"] = autoDownloadCheckBox.Checked ? "1" : "0";
+            WriteSettings(settings);
+            if (autoDownloadCheckBox.Checked && !isDownloading && ReadLinks().Count == 0)
+                ShowToast("Baixar ao colar ligado", "Cole um link e o download começa sozinho, com o tipo e o formato escolhidos.", null);
+        };
+        Controls.Add(autoDownloadCheckBox);
+        musicStatusTip.SetToolTip(autoDownloadCheckBox, "Cole um link e o download começa sozinho assim que o vídeo for identificado, com o tipo, o formato e a qualidade escolhidos.");
 
         localFileButton.Text = "＋  Arquivo";
         localFileButton.SetBounds(428, 85, 104, 40);
@@ -2004,7 +2540,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         musicStatusTip.SetToolTip(thumbnailSaveButton, "Salva a miniatura (capa) na maior qualidade disponível, na pasta de destino");
         // Aviso rápido dentro do app (não depende das notificações do Windows).
         toastPanel.Visible = false;
-        toastPanel.BorderColor = Color.FromArgb(16, 185, 129);
+        toastPanel.BorderColor = Theme.Accent;
         toastTitle.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
         toastTitle.AutoEllipsis = true;
         toastTitle.SetBounds(14, 6, 380, 18);
@@ -2053,6 +2589,15 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         typeBox.SelectedIndexChanged += delegate { UpdateFormats(); LayoutForm(); UpdateSizeEstimate(); };
         typeSurface.Controls.Add(typeBox);
         Controls.Add(typeSurface);
+        // O tipo agora é escolhido em "pílulas"; a lista antiga continua por baixo guardando a escolha.
+        typeSurface.Visible = false;
+        typeSwitch.Items = new string[] { "Áudio", "Vídeo", "Vídeo + Áudio" };
+        typeSwitch.Font = new Font("Segoe UI", 9F);
+        typeSwitch.SetBounds(28, 309, 208, 34);
+        typeSwitch.SelectedIndexChanged += delegate { if (typeBox.SelectedIndex != typeSwitch.SelectedIndex) typeBox.SelectedIndex = typeSwitch.SelectedIndex; };
+        typeBox.SelectedIndexChanged += delegate { if (typeSwitch.SelectedIndex != typeBox.SelectedIndex) typeSwitch.SelectedIndex = typeBox.SelectedIndex; };
+        musicStatusTip.SetToolTip(typeSwitch, "Áudio: só a música · Vídeo: o vídeo com som · Vídeo + Áudio: os dois arquivos (vídeo e MP3)");
+        Controls.Add(typeSwitch);
 
         ConfigureLabel(formatLabel, "Formato", 258, 286);
         formatSurface.SetBounds(256, 309, 208, 34);
@@ -2101,6 +2646,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
         progress.SetBounds(28, 448, 608, 14);
         progress.Visible = false;
+        progress.Active = false;
         Controls.Add(progress);
 
         percentLabel.Text = "0%";
@@ -2116,7 +2662,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         Controls.Add(queueProgressLabel);
 
         downloadButton.Text = "Baixar";
-        downloadButton.SetBounds(568, 493, 124, 40);
+        downloadButton.SetBounds(565, 492, 130, 46);
         downloadButton.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
         downloadButton.Cursor = Cursors.Hand;
         downloadButton.Enabled = false;
@@ -2266,7 +2812,8 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         ConfigureTimeBox(trimStartSurface, trimStartBox, true);
         ConfigureTimeBox(trimEndSurface, trimEndBox, false);
 
-        previewTimer.Interval = 700;
+        // Começa a identificar o link quase na hora (antes esperava 0,7 s).
+        previewTimer.Interval = 120;
         previewTimer.Tick += PreviewTimerTick;
         FormClosing += delegate(object closingSender, FormClosingEventArgs closingArgs)
         {
@@ -2300,6 +2847,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             }
         };
 
+        foreach (ComboBox combo in new ComboBox[] { formatBox, qualityBox }) ComboStyle.Apply(combo);
+        foreach (RoundedPanel field in new RoundedPanel[] { urlSurface, formatSurface, qualitySurface, folderSurface }) field.FocusRing = true;
+        previewCard.Elevated = true;
+        trimPanel.Elevated = true;
+        thumbnail.Radius = 10;
         typeBox.SelectedIndex = 0;
         ApplySavedChoices();
         SetPreviewVisible(false);
@@ -2376,21 +2928,25 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             lock (waveLock) waveFailed.Clear();
         }
         else StopPreview();
-        LayoutForm();
+        AnimateReveal(false, previewShown && trimCheckBox.Checked ? 1 : 0);
         LoadTrimTarget();
     }
 
     // Posiciona tudo que fica abaixo da prévia, de acordo com: prévia visível, corte ligado e quantidade de links.
     private void LayoutForm()
     {
-        int off = previewShown ? 0 : -144;
+        // Valores animados: a prévia e o painel de corte "abrem" e "fecham" suavemente.
+        int off = (int)Math.Round(-144 * (1 - previewReveal));
         bool multi = ReadLinks().Count > 1;
-        bool trimOn = previewShown && trimCheckBox.Checked;
+        bool trimOn = trimReveal > 0.01;
+        previewCard.Height = Math.Max(1, (int)Math.Round(126 * previewReveal));
+        previewCard.Visible = previewReveal > 0.01;
 
         typeLabel.Top = 286 + off;
         formatLabel.Top = 286 + off;
         qualityLabel.Top = 286 + off;
         typeSurface.Top = 309 + off;
+        typeSwitch.Top = 309 + off;
         formatSurface.Top = 309 + off;
         qualitySurface.Top = 309 + off;
         folderLabel.Top = 362 + off;
@@ -2434,15 +2990,15 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             trimSummaryLabel.SetBounds(130, 151, 404, 18);
             panelHeight = 181;
         }
-        trimPanel.SetBounds(28, 442 + off, 664, panelHeight);
+        trimPanel.SetBounds(28, 442 + off, 664, Math.Max(1, (int)Math.Round(panelHeight * trimReveal)));
         trimPanel.Visible = trimOn;
         trimCheckBox.Visible = previewShown;
 
-        int extra = trimOn ? panelHeight + 6 : 0;
+        int extra = (int)Math.Round((panelHeight + 6) * trimReveal);
         progress.Top = 448 + off + extra;
         percentLabel.Top = 443 + off + extra;
         queueProgressLabel.Top = 466 + off + extra;
-        downloadButton.Top = 493 + off + extra;
+        downloadButton.Top = 492 + off + extra;
         trimCheckBox.Top = 503 + off + extra;
         normalizeCheckBox.Top = 503 + off + extra;
         normalizeCheckBox.Left = trimCheckBox.Left + trimCheckBox.PreferredSize.Width + 18;
@@ -2455,35 +3011,12 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         sizeEstimateLabel.Visible = previewShown && !isDownloading && sizeEstimateLabel.Text.Length > 0;
 
         Size client = new Size(720, 560 + off + extra);
-        ResizeClientSmoothly(client);
-    }
-
-    // A janela cresce/encolhe suavemente quando a prévia ou o painel de corte aparecem.
-    private void ResizeClientSmoothly(Size client)
-    {
-        if (Motion.IsRunning(resizeMotion) && resizeTarget == client.Height) return;
-        if (ClientSize == client) { Motion.Stop(resizeMotion); resizeTarget = client.Height; MinimumSize = Size; return; }
-        resizeTarget = client.Height;
-        if (!Visible || !IsHandleCreated || WindowState != FormWindowState.Normal || !Motion.Enabled)
+        if (ClientSize != client)
         {
-            Motion.Stop(resizeMotion);
             MinimumSize = Size.Empty;
             ClientSize = client;
             MinimumSize = Size;
-            return;
         }
-        int from = ClientSize.Height;
-        int width = client.Width;
-        int to = client.Height;
-        MinimumSize = Size.Empty;
-        Motion.Run(resizeMotion, 260, delegate(double t)
-        {
-            ClientSize = new Size(width, from + (int)Math.Round((to - from) * t));
-        }, delegate
-        {
-            ClientSize = new Size(width, to);
-            MinimumSize = Size;
-        }, Motion.EaseInOutCubic);
     }
 
     private static string FormatTime(int totalSeconds)
@@ -2548,13 +3081,13 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                   (cut == 1 ? " editado" : " editados");
             trimSummaryLabel.Text = targetSize.Length > 0 ? edited + "  ·  este vídeo: " + targetSize.Replace("Arquivo final ", "") : edited + " · os demais completos";
             trimSummaryLabel.ForeColor = cut == 0
-                ? (darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139))
-                : Color.FromArgb(16, 185, 129);
+                ? Theme.Muted
+                : Theme.Accent;
         }
         else
         {
             trimSummaryLabel.Text = targetSize;
-            trimSummaryLabel.ForeColor = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+            trimSummaryLabel.ForeColor = Theme.Muted;
         }
         UpdateSizeEstimate();
     }
@@ -3183,6 +3716,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             }
             if (settings.TryGetValue("normalize", out text)) normalizeCheckBox.Checked = text == "1";
             if (settings.TryGetValue("subtitles", out text)) subtitlesCheckBox.Checked = text == "1";
+            if (settings.TryGetValue("auto-download", out text)) autoDownloadCheckBox.Checked = text == "1";
         }
         catch { }
     }
@@ -3233,16 +3767,16 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private void UpdateEngineButtonLook()
     {
         if (engineUpdating) return;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
+        Color mainText = Theme.Fg;
         if (engineState == 1)
         {
             updateButton.Text = "✓  Atualizado";
-            updateButton.ForeColor = darkMode ? Color.FromArgb(52, 211, 153) : Color.FromArgb(5, 150, 105);
+            updateButton.ForeColor = Theme.Accent;
         }
         else
         {
             updateButton.Text = "↻  Atualizar";
-            updateButton.ForeColor = mainText;
+            updateButton.ForeColor = Theme.Muted;
         }
         updateButton.Invalidate();
     }
@@ -3258,7 +3792,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         engineUpdating = true;
         updateButton.Enabled = false;
         updateButton.Text = "Verificando…";
-        updateButton.ForeColor = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
+        updateButton.ForeColor = Theme.Fg;
         string downloader = Program.YtDlpPath;
         System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
@@ -3651,11 +4185,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         g.InterpolationMode = InterpolationMode.HighQualityBicubic;
         bool inEdit = (e.State & DrawItemState.ComboBoxEdit) != 0;
         bool highlighted = !inEdit && (e.State & DrawItemState.Selected) != 0;
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
-        Color accent = Color.FromArgb(16, 185, 129);
-        Color back = highlighted ? (darkMode ? Color.FromArgb(24, 66, 54) : Color.FromArgb(236, 253, 245)) : surface;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
+        Color accent = Theme.Accent;
+        Color back = highlighted ? Theme.AccentSoft : surface;
         using (SolidBrush brush = new SolidBrush(back)) g.FillRectangle(brush, e.Bounds);
         if (e.Index < 0 || e.Index >= trimTargetBox.Items.Count) return;
         TrimTargetItem item = trimTargetBox.Items[e.Index] as TrimTargetItem;
@@ -3666,7 +4200,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         {
             Region previousClip = g.Clip;
             g.SetClip(path, CombineMode.Intersect);
-            using (SolidBrush placeholder = new SolidBrush(darkMode ? Color.FromArgb(60, 60, 60) : Color.FromArgb(226, 232, 240)))
+            using (SolidBrush placeholder = new SolidBrush(Theme.Track))
                 g.FillRectangle(placeholder, thumb);
             if (item.Thumbnail != null)
             {
@@ -3746,7 +4280,9 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
     private void ConfigureLabel(Label label, string text, int x, int y)
     {
-        label.Text = text;
+        // Rótulos no estilo do ForeverNote: pequenos, em maiúsculas e discretos.
+        label.Font = Theme.Semibold(7.75F);
+        label.Text = text.ToUpper(CultureInfo.CurrentCulture);
         label.AutoSize = true;
         label.Location = new Point(x, y);
         Controls.Add(label);
@@ -3755,32 +4291,33 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private void ApplyTheme()
     {
         // Neutral charcoal surfaces keep dark mode from reading as navy blue.
-        // v5: o fundo da janela é borrado e os cards/botões são de vidro (translúcidos) por cima dele.
-        Color background = darkMode ? Color.FromArgb(17, 17, 20) : Color.FromArgb(236, 241, 247);
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color cardColor = darkMode ? Color.FromArgb(40, 40, 46) : Color.White;
-        int cardAlpha = darkMode ? 165 : 170;
-        int buttonAlpha = darkMode ? 140 : 180;
-        Color glassBorder = darkMode ? Color.FromArgb(40, 255, 255, 255) : Color.FromArgb(120, 148, 163, 184);
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        Color background = Theme.Bg;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
         BackColor = background;
         ForeColor = mainText;
         titleLabel.ForeColor = mainText;
         subtitleLabel.ForeColor = mutedText;
-        versionLabel.ForeColor = mutedText;
-        linkLabel.ForeColor = mainText;
-        typeLabel.ForeColor = mainText;
-        formatLabel.ForeColor = mainText;
-        qualityLabel.ForeColor = mainText;
-        folderLabel.ForeColor = mainText;
+        versionLabel.ForeColor = Theme.Faint;
+        linkLabel.ForeColor = Theme.Faint;
+        typeLabel.ForeColor = Theme.Faint;
+        formatLabel.ForeColor = Theme.Faint;
+        qualityLabel.ForeColor = Theme.Faint;
+        folderLabel.ForeColor = Theme.Faint;
+        brandMark.Invalidate();
+        typeSwitch.TrackColor = Theme.Dark ? Theme.Sunken : Theme.Track;
+        typeSwitch.PillColor = Theme.Dark ? Motion.Mix(Theme.Raised, Color.White, 0.07) : Theme.Raised;
+        typeSwitch.TextColor = mutedText;
+        typeSwitch.SelectedTextColor = mainText;
+        typeSwitch.Invalidate();
         videoTitleLabel.ForeColor = mainText;
         videoDetailsLabel.ForeColor = mutedText;
         queueProgressLabel.ForeColor = mutedText;
         musicStatusLabel.ForeColor = mutedText;
         previewCard.BackColor = surface;
-        previewCard.BorderColor = darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240);
-        thumbnail.PlaceholderColor = darkMode ? Color.FromArgb(55, 55, 55) : Color.FromArgb(226, 232, 240);
+        previewCard.BorderColor = Theme.Line;
+        thumbnail.PlaceholderColor = Theme.Track;
         thumbnail.PlaceholderTextColor = mutedText;
         thumbnail.Invalidate();
         urlBox.BackColor = surface;
@@ -3790,7 +4327,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         typeSurface.BackColor = surface;
         formatSurface.BackColor = surface;
         qualitySurface.BackColor = surface;
-        Color inputBorder = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        Color inputBorder = Theme.LineStrong;
         urlSurface.BorderColor = inputBorder;
         folderSurface.BorderColor = inputBorder;
         typeSurface.BorderColor = inputBorder;
@@ -3806,39 +4343,41 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         qualityBox.ForeColor = mainText;
         browseButton.BackColor = surface;
         browseButton.ForeColor = mainText;
-        browseButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        progress.TrackColor = darkMode ? Color.FromArgb(55, 55, 55) : Color.FromArgb(226, 232, 240);
-        progress.FillColor = Color.FromArgb(16, 185, 129);
+        browseButton.BorderColor = Theme.LineStrong;
+        progress.TrackColor = Theme.Track;
+        progress.FillColor = Theme.Accent;
         progress.BackColor = background;
         percentLabel.ForeColor = mutedText;
-        downloadButton.BackColor = Color.FromArgb(16, 185, 129);
-        downloadButton.ForeColor = Color.White;
+        downloadButton.BackColor = Theme.Accent;
+        downloadButton.ForeColor = Theme.OnAccent;
+        downloadButton.Look = ButtonLook.Primary;
         downloadButton.BorderColor = Color.Transparent;
         trimPanel.BackColor = surface;
-        trimPanel.BorderColor = darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240);
+        trimPanel.BorderColor = Theme.Line;
         trimCheckBox.ForeColor = mainText;
         trimInfoLabel.ForeColor = mainText;
         trimStartLabel.ForeColor = mutedText;
         trimEndLabel.ForeColor = mutedText;
         normalizeCheckBox.ForeColor = mainText;
+        autoDownloadCheckBox.ForeColor = mutedText;
         sizeEstimateLabel.ForeColor = mutedText;
         subtitlesCheckBox.ForeColor = mainText;
         trimSegmentsFlow.BackColor = surface;
         addSegmentButton.BackColor = surface;
         addSegmentButton.ForeColor = mainText;
-        addSegmentButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        addSegmentButton.BorderColor = Theme.LineStrong;
         thumbnailSaveButton.BackColor = surface;
         thumbnailSaveButton.ForeColor = mainText;
-        thumbnailSaveButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        thumbnailSaveButton.BorderColor = Theme.LineStrong;
         localFileButton.BackColor = surface;
         localFileButton.ForeColor = mainText;
-        localFileButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        clipboardButton.BackColor = Color.FromArgb(16, 185, 129);
-        clipboardButton.ForeColor = Color.White;
+        localFileButton.BorderColor = Theme.LineStrong;
+        clipboardButton.BackColor = Theme.Accent;
+        clipboardButton.ForeColor = Theme.OnAccent;
         clipboardButton.BorderColor = Color.Transparent;
         if (trimPanel.Visible) RefreshSegmentChips();
-        Color timeBoxBack = darkMode ? Color.FromArgb(37, 37, 37) : Color.FromArgb(248, 250, 252);
-        Color timeBoxBorder = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        Color timeBoxBack = Theme.Sunken;
+        Color timeBoxBorder = Theme.LineStrong;
         trimStartSurface.BackColor = timeBoxBack;
         trimEndSurface.BackColor = timeBoxBack;
         trimStartSurface.BorderColor = timeBoxBorder;
@@ -3849,86 +4388,44 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         trimEndBox.ForeColor = mainText;
         trimSummaryLabel.ForeColor = mutedText;
         trimTargetSurface.BackColor = surface;
-        trimTargetSurface.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        trimTargetSurface.BorderColor = Theme.LineStrong;
         trimTargetBox.BackColor = surface;
         trimTargetBox.ForeColor = mainText;
         trimTargetBox.Invalidate();
         trimResetButton.BackColor = surface;
         trimResetButton.ForeColor = mainText;
-        trimResetButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        timeRangeSlider.TrackColor = darkMode ? Color.FromArgb(78, 78, 78) : Color.FromArgb(203, 213, 225);
-        timeRangeSlider.WaveBackColor = darkMode ? Color.FromArgb(37, 37, 37) : Color.FromArgb(248, 250, 252);
+        trimResetButton.BorderColor = Theme.LineStrong;
+        timeRangeSlider.TrackColor = Theme.Track;
+        timeRangeSlider.WaveBackColor = Theme.Sunken;
         timeRangeSlider.StatusTextColor = mutedText;
         timeRangeSlider.PlayheadColor = mainText;
         trimPlayButton.BackColor = surface;
-        trimPlayButton.ForeColor = darkMode ? Color.FromArgb(52, 211, 153) : Color.FromArgb(5, 150, 105);
-        trimPlayButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        trimPlayButton.ForeColor = Theme.Accent;
+        trimPlayButton.BorderColor = Theme.LineStrong;
         volumeControl.IconColor = mutedText;
-        volumeControl.TrackColor = darkMode ? Color.FromArgb(78, 78, 78) : Color.FromArgb(203, 213, 225);
-        volumeControl.AccentColor = Color.FromArgb(16, 185, 129);
+        volumeControl.TrackColor = Theme.Track;
+        volumeControl.AccentColor = Theme.Accent;
         volumeControl.Invalidate();
-        timeRangeSlider.HighlightColor = Color.FromArgb(16, 185, 129);
+        timeRangeSlider.HighlightColor = Theme.Accent;
         timeRangeSlider.Invalidate();
         if (trimPanel.Visible) UpdateTrimLabels();
-        themeButton.BackColor = surface;
-        themeButton.ForeColor = mainText;
-        themeButton.BorderColor = Color.Transparent;
+        // Botões do topo no estilo "fantasma" do ForeverNote: sem moldura, acendem ao passar o mouse.
+        foreach (RoundedButton ghost in new RoundedButton[] { themeButton, historyButton, updateButton, converterButton })
+        {
+            ghost.BackColor = background;
+            ghost.ForeColor = mutedText;
+            ghost.HoverForeColor = mainText;
+            ghost.BorderColor = Color.Transparent;
+            ghost.Invalidate();
+        }
+        themeButton.Font = new Font("Segoe UI", 11F);
         themeButton.Text = darkMode ? "☀" : "☾";
         musicStatusTip.SetToolTip(themeButton, darkMode ? "Mudar para o modo claro" : "Mudar para o modo escuro");
-        converterButton.BackColor = surface;
-        converterButton.ForeColor = mainText;
-        converterButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
         ApplyWindowChrome(this);
         queueButton.BackColor = surface;
         queueButton.ForeColor = mainText;
-        queueButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        historyButton.BackColor = surface;
-        historyButton.ForeColor = mainText;
-        historyButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        updateButton.BackColor = surface;
-        updateButton.ForeColor = mainText;
-        updateButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        ApplyGlass(cardColor, cardAlpha, buttonAlpha, glassBorder);
+        queueButton.BorderColor = Theme.LineStrong;
         UpdateEngineButtonLook();
-        Invalidate(true);
-    }
-
-    // Deixa cards, botões e textos da janela principal translúcidos sobre o fundo borrado.
-    // Campos de texto e listas continuam sólidos (o Windows não desenha esses controles sobre vidro).
-    private void ApplyGlass(Color cardColor, int cardAlpha, int buttonAlpha, Color glassBorder)
-    {
-        foreach (RoundedPanel card in new RoundedPanel[] { previewCard, trimPanel })
-        {
-            card.BackColor = cardColor;
-            card.GlassAlpha = cardAlpha;
-            card.BorderColor = glassBorder;
-        }
-        foreach (RoundedButton button in new RoundedButton[] { themeButton, historyButton, updateButton, converterButton, queueButton,
-            browseButton, localFileButton, thumbnailSaveButton, addSegmentButton, trimResetButton, trimPlayButton })
-        {
-            button.GlassAlpha = buttonAlpha;
-            if (button != themeButton) button.BorderColor = glassBorder;
-            button.Invalidate();
-        }
-        trimSegmentsFlow.BackColor = Color.Transparent;
-        progress.TrackColor = darkMode ? Color.FromArgb(60, 255, 255, 255) : Color.FromArgb(70, 100, 116, 139);
-        timeRangeSlider.WaveBackColor = darkMode ? Color.FromArgb(70, 0, 0, 0) : Color.FromArgb(150, 255, 255, 255);
-        MakeLabelsGlass(this);
-    }
-
-    private void MakeLabelsGlass(Control root)
-    {
-        RoundedPanel rootPanel = root as RoundedPanel;
-        bool glassParent = root == this || (rootPanel != null && rootPanel.GlassAlpha < 255);
-        foreach (Control child in root.Controls)
-        {
-            if (glassParent && (child is Label || child is CheckBox))
-            {
-                if (child.BackColor != Color.Transparent) child.BackColor = Color.Transparent;
-                Glass.EnableDoubleBuffer(child);
-            }
-            if (child is RoundedPanel) MakeLabelsGlass(child);
-        }
     }
 
     private void UpdateFormats()
@@ -3946,7 +4443,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     {
         if (typeBox.SelectedIndex >= 1)
         {
-            qualityLabel.Text = "Resolução máxima";
+            qualityLabel.Text = "RESOLUÇÃO MÁXIMA";
             qualityBox.Enabled = true;
             qualityBox.Items.Clear();
             qualityBox.Items.AddRange(new object[] { "Melhor disponível", "4K (2160p)", "2K (1440p)", "1080p", "720p", "480p", "360p" });
@@ -3954,7 +4451,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         }
         else if (formatBox.SelectedItem != null && formatBox.SelectedItem.ToString() == "MP3")
         {
-            qualityLabel.Text = "Bitrate MP3";
+            qualityLabel.Text = "BITRATE MP3";
             qualityBox.Enabled = true;
             qualityBox.Items.Clear();
             qualityBox.Items.AddRange(new object[] { "320 kbps", "256 kbps", "192 kbps", "128 kbps" });
@@ -3962,7 +4459,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         }
         else
         {
-            qualityLabel.Text = "Bitrate";
+            qualityLabel.Text = "BITRATE";
             qualityBox.Enabled = false;
             qualityBox.Items.Clear();
             qualityBox.Items.Add("Não aplicável");
@@ -4034,12 +4531,15 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             if (links.Exists(delegate(string link) { return !IsYouTubeUrl(link); }))
             {
                 videoTitleLabel.Text = "Confira os links informados";
+                thumbnail.Loading = false;
                 videoDetailsLabel.Text = "Use um link válido por linha (YouTube, TikTok, Instagram, X…).";
                 musicStatusLabel.Text = "Não foi possível verificar a etiqueta Música";
             }
             else
             {
                 videoTitleLabel.Text = "Identificando vídeo…";
+                thumbnail.Loading = true;
+                autoDownloadArmed = autoDownloadCheckBox.Checked;
                 videoDetailsLabel.Text = links.Count > 1 ? links.Count.ToString(CultureInfo.InvariantCulture) + " links na fila" : "Buscando título e miniatura";
                 musicStatusLabel.Text = "Verificando direitos autorais…";
                 previewTimer.Start();
@@ -4051,6 +4551,21 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             SetPreviewVisible(false);
             downloadButton.Text = "Baixar";
         }
+    }
+
+    // Começa o download sozinho quando "Baixar ao colar" está ligado e todos os links foram identificados.
+    private void TryAutoDownload(List<string> links)
+    {
+        if (!autoDownloadArmed || !autoDownloadCheckBox.Checked || isDownloading || engineUpdating) return;
+        if (links.Count == 0 || !AreAllLinksValid(links)) return;
+        foreach (string link in links)
+        {
+            if (IsLocalMedia(link)) continue;
+            QueueVideoInfo info = PeekQueueInfo(link);
+            if (info == null || String.IsNullOrEmpty(info.InfoJsonPath)) return;
+        }
+        autoDownloadArmed = false;
+        StartDownload(this, EventArgs.Empty);
     }
 
     private List<string> ReadLinks()
@@ -4107,8 +4622,31 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     {
         if (previewShown == visible) return;
         previewShown = visible;
-        previewCard.Visible = visible;
-        LayoutForm();
+        AnimateReveal(true, visible ? 1 : 0);
+        AnimateReveal(false, visible && trimCheckBox.Checked ? 1 : 0);
+    }
+
+    // Abre/fecha a prévia ou o painel de corte deslizando o resto da janela junto (a janela cresce suavemente).
+    private void AnimateReveal(bool preview, double target)
+    {
+        object key = preview ? previewRevealKey : trimRevealKey;
+        double from = preview ? previewReveal : trimReveal;
+        if (!IsHandleCreated || !Visible || (Math.Abs(from - target) < 0.001 && !Motion.IsRunning(key)))
+        {
+            Motion.Stop(key);
+            if (preview) previewReveal = target; else trimReveal = target;
+            LayoutForm();
+            return;
+        }
+        Motion.Run(key, preview ? 460 : 420, delegate(double t)
+        {
+            if (IsDisposed) return;
+            double value = from + (target - from) * t;
+            if (preview) previewReveal = value; else trimReveal = value;
+            Redraw.Suspend(this);
+            try { LayoutForm(); }
+            finally { Redraw.Resume(this); }
+        }, null, Motion.EaseOut);
     }
 
     private string HistoryFilePath
@@ -4202,13 +4740,14 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private void ShowDownloadHistory(object sender, EventArgs e)
     {
         List<DownloadHistoryEntry> entries = LoadDownloadHistory();
-        Color background = darkMode ? Color.FromArgb(31, 31, 31) : Color.FromArgb(241, 245, 249);
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        Color background = Theme.Bg;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
 
         Form dialog = new Form();
         Motion.FadeIn(dialog);
+        Buffering.Enable(dialog);
         dialog.Text = "Downloads";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -4239,7 +4778,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         clearButton.SetBounds(396, 22, 146, 34);
         clearButton.BackColor = surface;
         clearButton.ForeColor = mainText;
-        clearButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        clearButton.BorderColor = Theme.LineStrong;
         clearButton.Cursor = entries.Count > 0 ? Cursors.Hand : Cursors.Default;
         clearButton.Enabled = entries.Count > 0;
         dialog.Controls.Add(clearButton);
@@ -4303,7 +4842,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             card.SetBounds(0, 0, 492, 68);
             card.Margin = new Padding(2, 2, 2, 7);
             card.BackColor = surface;
-            card.BorderColor = darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240);
+            card.BorderColor = Theme.Line;
 
             string path = entry.FilePath;
             Action playAction = delegate
@@ -4346,7 +4885,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             playButton.SetBounds(282, 17, 86, 34);
             playButton.BackColor = surface;
             playButton.ForeColor = mainText;
-            playButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+            playButton.BorderColor = Theme.LineStrong;
             playButton.Cursor = Cursors.Hand;
             playButton.Click += delegate { playAction(); };
             card.Controls.Add(playButton);
@@ -4356,7 +4895,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             openButton.SetBounds(374, 17, 104, 34);
             openButton.BackColor = surface;
             openButton.ForeColor = mainText;
-            openButton.BorderColor = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+            openButton.BorderColor = Theme.LineStrong;
             openButton.Cursor = Cursors.Hand;
             openButton.Click += delegate
             {
@@ -4380,13 +4919,14 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     {
         List<string> links = ReadLinks();
         if (links.Count == 0) return;
-        Color background = darkMode ? Color.FromArgb(31, 31, 31) : Color.FromArgb(241, 245, 249);
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        Color background = Theme.Bg;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
 
         Form dialog = new Form();
         Motion.FadeIn(dialog);
+        Buffering.Enable(dialog);
         dialog.Text = "Fila de downloads";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -4441,7 +4981,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         List<QueueVideoRow> rows = new List<QueueVideoRow>();
         Dictionary<Control, QueueVideoRow> cardRows = new Dictionary<Control, QueueVideoRow>();
         Control selectedCard = null;
-        Color selectedBorder = Color.FromArgb(16, 185, 129);
+        Color selectedBorder = Theme.Accent;
         Action<Control> selectCard = delegate(Control selected)
         {
             selectedCard = selected;
@@ -4452,7 +4992,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 {
                     itemCard.BorderColor = itemCard == selectedCard
                         ? selectedBorder
-                        : (darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240));
+                        : Theme.Line;
                     itemCard.Invalidate();
                 }
             }
@@ -4502,10 +5042,10 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             card.Margin = new Padding(2, 2, 2, 8);
             card.BackColor = surface;
             card.Tag = links[i];
-            card.BorderColor = darkMode ? Color.FromArgb(62, 62, 62) : Color.FromArgb(226, 232, 240);
+            card.BorderColor = Theme.Line;
 
             RoundedThumbnail rowThumbnail = new RoundedThumbnail();
-            rowThumbnail.PlaceholderColor = darkMode ? Color.FromArgb(55, 55, 55) : Color.FromArgb(226, 232, 240);
+            rowThumbnail.PlaceholderColor = Theme.Track;
             rowThumbnail.PlaceholderTextColor = mutedText;
             rowThumbnail.SetBounds(12, 12, 108, 68);
             card.Controls.Add(rowThumbnail);
@@ -4551,7 +5091,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                     ? (cachedInfo.HasMusicCredit.Value ? "Direitos autorais detectados" : "Livre de direitos autorais")
                     : "Não foi possível verificar a etiqueta Música";
                 row.MusicStatus.ForeColor = cachedInfo.HasMusicCredit == true
-                    ? (darkMode ? Color.FromArgb(235, 190, 105) : Color.FromArgb(153, 95, 18))
+                    ? Theme.Warn
                     : mutedText;
                 queueTip.SetToolTip(row.MusicStatus, cachedInfo.HasMusicCredit == true
                     ? "A seção Música foi identificada na página do YouTube."
@@ -4590,6 +5130,10 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             result.Details = "Componente yt-dlp.exe não encontrado.";
             return result;
         }
+        // A checagem de "Música" do YouTube roda ao mesmo tempo que o yt-dlp (antes era uma depois da outra).
+        Task<bool?> musicCheck = IsYouTubeHost(url)
+            ? Task.Factory.StartNew<bool?>(delegate { return DetectYoutubeMusicSection(url); })
+            : null;
         try
         {
             ProcessStartInfo info = new ProcessStartInfo();
@@ -4625,7 +5169,12 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                     result.FetchedAt = DateTime.Now;
                 }
                 catch { }
-                bool? musicSection = IsYouTubeHost(url) ? DetectYoutubeMusicSection(url) : null;
+                bool? musicSection = null;
+                if (musicCheck != null)
+                {
+                    try { musicSection = musicCheck.Wait(12000) ? musicCheck.Result : null; }
+                    catch { musicSection = null; }
+                }
                 result.HasMusicCredit = musicSection == true || (musicSection != false && HasMusicCredit(metadata))
                     ? (bool?)true
                     : musicSection;
@@ -4722,7 +5271,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         List<string> snapshot = new List<string>(links);
         string shown = snapshot.Count > 0 ? snapshot[snapshot.Count - 1] : null;
         // Título, canal e capa em ~0,2 s pelo atalho oficial do YouTube, enquanto o resto carrega.
-        if (shown != null && IsYouTubeHost(shown) && PeekQueueInfo(shown) == null)
+        if (shown != null && QuickPreviewEndpoint(shown) != null && PeekQueueInfo(shown) == null)
             System.Threading.ThreadPool.QueueUserWorkItem(delegate { ShowQuickPreview(shown, requestId); });
         System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
@@ -4760,6 +5309,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                         if (IsDisposed || requestId != previewRequestId) return;
                         UpdateQueueButton(ReadLinks());
                         if (!isDownloading) RefreshTrimTargets();
+                        TryAutoDownload(snapshot);
                     });
                 }
                 catch { }
@@ -4850,22 +5400,66 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
     private int fullPreviewShownFor = -1;
 
+    // Atalhos oficiais (oEmbed) que devolvem título, canal e capa em ~0,2 s, enquanto o yt-dlp carrega o resto.
+    private static string QuickPreviewEndpoint(string link)
+    {
+        if (IsYouTubeHost(link)) return "https://www.youtube.com/oembed?format=json&url=" + Uri.EscapeDataString(link);
+        Uri uri;
+        if (!Uri.TryCreate(link, UriKind.Absolute, out uri)) return null;
+        string host = uri.Host.ToLowerInvariant();
+        string encoded = Uri.EscapeDataString(link);
+        if (host == "tiktok.com" || host.EndsWith(".tiktok.com")) return "https://www.tiktok.com/oembed?url=" + encoded;
+        if (host == "vimeo.com" || host.EndsWith(".vimeo.com")) return "https://vimeo.com/api/oembed.json?url=" + encoded;
+        if (host == "soundcloud.com" || host.EndsWith(".soundcloud.com")) return "https://soundcloud.com/oembed?format=json&url=" + encoded;
+        if (host == "dailymotion.com" || host.EndsWith(".dailymotion.com") || host == "dai.ly") return "https://www.dailymotion.com/services/oembed?format=json&url=" + encoded;
+        return null;
+    }
+
+    private static readonly Regex YouTubeIdPattern = new Regex(@"(?:[?&]v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", RegexOptions.Compiled);
+
+    private static string YouTubeId(string link)
+    {
+        if (!IsYouTubeHost(link)) return null;
+        Match match = YouTubeIdPattern.Match(link);
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
     private void ShowQuickPreview(string link, int requestId)
     {
         try
         {
+            // No YouTube a capa tem endereço fixo: baixa ao mesmo tempo que o título (aparece quase instantâneo).
+            string id = YouTubeId(link);
+            if (id != null)
+            {
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    Image fast = DownloadThumbnail("https://i.ytimg.com/vi/" + id + "/mqdefault.jpg");
+                    if (fast == null) return;
+                    if (IsDisposed || !IsHandleCreated || requestId != previewRequestId) { fast.Dispose(); return; }
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (IsDisposed || requestId != previewRequestId || fullPreviewShownFor == requestId || thumbnail.Image != null) { fast.Dispose(); return; }
+                            SetThumbnail(fast);
+                        });
+                    }
+                    catch { fast.Dispose(); }
+                });
+            }
             string json;
             using (TimeoutWebClient client = new TimeoutWebClient())
             {
                 client.Encoding = Encoding.UTF8;
                 client.Headers.Add("User-Agent", "Mozilla/5.0");
-                json = client.DownloadString("https://www.youtube.com/oembed?format=json&url=" + Uri.EscapeDataString(link));
+                json = client.DownloadString(QuickPreviewEndpoint(link));
             }
             Dictionary<string, object> data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
             string title = JsonString(data, "title");
             string author = JsonString(data, "author_name");
             if (title.Length == 0 || requestId != previewRequestId) return;
-            Image image = DownloadThumbnail(JsonString(data, "thumbnail_url"));
+            Image image = id != null ? null : DownloadThumbnail(JsonString(data, "thumbnail_url"));
             if (IsDisposed || !IsHandleCreated)
             {
                 if (image != null) image.Dispose();
@@ -4880,10 +5474,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 }
                 videoTitleLabel.Text = title;
                 videoDetailsLabel.Text = author.Length > 0 ? author + "  ·  carregando detalhes…" : "Carregando detalhes…";
+                Motion.FadeText(videoTitleLabel, Theme.Fg, 320);
+                Motion.FadeText(videoDetailsLabel, Theme.Muted, 420);
                 if (image != null)
                 {
-                    DisposeThumbnail();
-                    thumbnail.Image = image;
+                    SetThumbnail(image);
                 }
             });
         }
@@ -4907,16 +5502,16 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                     return;
                 }
                 fullPreviewShownFor = requestId;
-                videoTitleLabel.Text = title;
-                videoDetailsLabel.Text = details;
+                if (videoTitleLabel.Text != title) { videoTitleLabel.Text = title; Motion.FadeText(videoTitleLabel, Theme.Fg, 320); }
+                if (videoDetailsLabel.Text != details) { videoDetailsLabel.Text = details; Motion.FadeText(videoDetailsLabel, Theme.Muted, 420); }
                 if (hasMusicCredit.HasValue)
                 {
                     musicStatusLabel.Text = hasMusicCredit.Value
                         ? "Direitos autorais detectados"
                         : "Livre de direitos autorais";
                     musicStatusLabel.ForeColor = hasMusicCredit.Value
-                        ? (darkMode ? Color.FromArgb(235, 190, 105) : Color.FromArgb(153, 95, 18))
-                        : (darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139));
+                        ? Theme.Warn
+                        : Theme.Muted;
                     musicStatusTip.SetToolTip(musicStatusLabel, hasMusicCredit.Value
                         ? "A seção Música foi identificada na página do YouTube."
                         : "A seção Música não foi identificada na página do YouTube.");
@@ -4924,14 +5519,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 else
                 {
                     musicStatusLabel.Text = "Não foi possível consultar os metadados musicais";
-                    musicStatusLabel.ForeColor = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+                    musicStatusLabel.ForeColor = Theme.Muted;
                     musicStatusTip.SetToolTip(musicStatusLabel, "Não foi possível obter os metadados deste vídeo. Tente novamente mais tarde.");
                 }
-                if (image != null)
-                {
-                    DisposeThumbnail();
-                    thumbnail.Image = image;
-                }
+                if (image != null) SetThumbnail(image);
+                thumbnail.Loading = false;
                 if (!isDownloading) RefreshTrimTargets();
                 UpdateDownloadButton();
             });
@@ -5094,6 +5686,21 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         return last.Length > 150 ? last.Substring(0, 147) + "…" : last;
     }
 
+    // Troca a miniatura com fade cruzado (a antiga é descartada quando a nova termina de aparecer).
+    private void SetThumbnail(Image image)
+    {
+        Image old = thumbnail.Image;
+        thumbnail.Loading = false;
+        thumbnail.Image = image;
+        if (old != null && old != image)
+        {
+            Timer later = new Timer();
+            later.Interval = 450;
+            later.Tick += delegate { later.Stop(); later.Dispose(); old.Dispose(); };
+            later.Start();
+        }
+    }
+
     private void DisposeThumbnail()
     {
         Image old = thumbnail.Image;
@@ -5246,6 +5853,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         progress.Value = 0;
         percentLabel.Text = "0%";
         progress.Visible = true;
+        progress.Active = true;
         percentLabel.Visible = true;
         queueProgressLabel.Text = "Preparando…";
         queueProgressLabel.Visible = true;
@@ -5294,6 +5902,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     {
         urlBox.Enabled = enabled;
         typeBox.Enabled = enabled;
+        typeSwitch.Enabled = enabled;
         formatBox.Enabled = enabled;
         qualityBox.Enabled = enabled;
         folderBox.Enabled = enabled;
@@ -5437,10 +6046,10 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private void RefreshSegmentChips()
     {
         List<TrimSegment> list = GetSavedSegments(trimTargetLink);
-        Color surface = darkMode ? Color.FromArgb(37, 37, 37) : Color.FromArgb(240, 253, 248);
-        Color border = Color.FromArgb(16, 185, 129);
-        Color text = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color muted = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        Color surface = Theme.AccentSoft;
+        Color border = Theme.Accent;
+        Color text = Theme.Fg;
+        Color muted = Theme.Muted;
         trimSegmentsFlow.SuspendLayout();
         while (trimSegmentsFlow.Controls.Count > 0)
         {
@@ -5890,132 +6499,6 @@ internal sealed class DownloaderForm : Form, IGlassSurface
 
     // ===================== Acabamento visual =====================
 
-    // Fundo translúcido: manchas de cor borradas, geradas uma vez por tema e reaproveitadas.
-    private Bitmap GetBackdrop()
-    {
-        int width = Math.Max(1, ClientSize.Width);
-        int height = Math.Max(1100, ClientSize.Height);
-        if (backdrop != null && backdropDark == darkMode && backdrop.Width == width && backdrop.Height >= height) return backdrop;
-        Bitmap fresh = Glass.CreateBackdrop(width, height + 200, darkMode);
-        if (backdrop != null) backdrop.Dispose();
-        backdrop = fresh;
-        backdropDark = darkMode;
-        return backdrop;
-    }
-
-    public void PaintGlass(Graphics graphics)
-    {
-        Glass.DrawBackdrop(graphics, GetBackdrop(), BackColor);
-    }
-
-    protected override void OnPaintBackground(PaintEventArgs e)
-    {
-        PaintGlass(e.Graphics);
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing && backdrop != null) { backdrop.Dispose(); backdrop = null; }
-        base.Dispose(disposing);
-    }
-
-    // Por cima da janela, mostra a "foto" do tema antigo e some aos poucos, revelando o tema novo.
-    private sealed class ThemeFadeOverlay : Form
-    {
-        public ThemeFadeOverlay(Bitmap snapshot)
-        {
-            FormBorderStyle = FormBorderStyle.None;
-            ShowInTaskbar = false;
-            StartPosition = FormStartPosition.Manual;
-            BackgroundImage = snapshot;
-            BackgroundImageLayout = ImageLayout.None;
-            DoubleBuffered = true;
-        }
-
-        protected override bool ShowWithoutActivation { get { return true; } }
-
-        protected override CreateParams CreateParams
-        {
-            get
-            {
-                CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x80 | 0x20 | 0x08000000; // ferramenta, clique atravessa, não ativa
-                return cp;
-            }
-        }
-    }
-
-    private ThemeFadeOverlay themeOverlay;
-    private Bitmap themeSnapshot;
-
-    private void FinishThemeFade()
-    {
-        Motion.Stop(themeMotion);
-        if (themeOverlay != null)
-        {
-            try { themeOverlay.Close(); themeOverlay.Dispose(); }
-            catch { }
-            themeOverlay = null;
-        }
-        if (themeSnapshot != null) { themeSnapshot.Dispose(); themeSnapshot = null; }
-    }
-
-    private void ToggleThemeAnimated()
-    {
-        FinishThemeFade();
-        Bitmap snapshot = null;
-        Rectangle area = Rectangle.Empty;
-        if (Motion.Enabled && Visible && WindowState == FormWindowState.Normal && Opacity >= 1)
-        {
-            try
-            {
-                area = RectangleToScreen(ClientRectangle);
-                if (SystemInformation.VirtualScreen.Contains(area))
-                {
-                    snapshot = new Bitmap(area.Width, area.Height);
-                    using (Graphics g = Graphics.FromImage(snapshot)) g.CopyFromScreen(area.Location, Point.Empty, area.Size);
-                }
-            }
-            catch
-            {
-                if (snapshot != null) snapshot.Dispose();
-                snapshot = null;
-            }
-        }
-        ThemeFadeOverlay overlay = null;
-        if (snapshot != null)
-        {
-            try
-            {
-                overlay = new ThemeFadeOverlay(snapshot);
-                overlay.Bounds = area;
-                overlay.Opacity = 1;
-                overlay.Show(this);
-                overlay.Update();
-            }
-            catch
-            {
-                if (overlay != null) overlay.Dispose();
-                overlay = null;
-            }
-        }
-        darkMode = !darkMode;
-        ApplyTheme();
-        if (overlay == null)
-        {
-            if (snapshot != null) snapshot.Dispose();
-            return;
-        }
-        Refresh();
-        themeOverlay = overlay;
-        themeSnapshot = snapshot;
-        ThemeFadeOverlay fading = overlay;
-        Motion.Run(themeMotion, 300, delegate(double t)
-        {
-            if (!fading.IsDisposed) fading.Opacity = 1 - t;
-        }, delegate { FinishThemeFade(); }, Motion.EaseInOutCubic);
-    }
-
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 
@@ -6033,8 +6516,60 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             if (DwmSetWindowAttribute(form.Handle, 20, ref dark, 4) != 0) DwmSetWindowAttribute(form.Handle, 19, ref dark, 4);
             int round = 2;
             DwmSetWindowAttribute(form.Handle, 33, ref round, 4);
+            // Windows 11: barra de título e borda na mesma cor do fundo do app (visual "sem moldura").
+            Color caption = Theme.Bg;
+            int captionColor = caption.R | (caption.G << 8) | (caption.B << 16);
+            DwmSetWindowAttribute(form.Handle, 35, ref captionColor, 4);
+            Color line = Theme.Line;
+            int borderColor = line.R | (line.G << 8) | (line.B << 16);
+            DwmSetWindowAttribute(form.Handle, 34, ref borderColor, 4);
+            Color fg = Theme.Fg;
+            int textColor = fg.R | (fg.G << 8) | (fg.B << 16);
+            DwmSetWindowAttribute(form.Handle, 36, ref textColor, 4);
         }
         catch { }
+    }
+
+    // Troca de tema com fade cruzado: uma "foto" da janela some devagar por cima das cores novas.
+    private void SwitchThemeAnimated()
+    {
+        Form overlay = null;
+        Bitmap snapshot = null;
+        try
+        {
+            if (Visible && WindowState != FormWindowState.Minimized && Environment.OSVersion.Platform == PlatformID.Win32NT)
+            {
+                Rectangle area = RectangleToScreen(ClientRectangle);
+                snapshot = new Bitmap(area.Width, area.Height);
+                using (Graphics g = Graphics.FromImage(snapshot)) g.CopyFromScreen(area.Location, Point.Empty, area.Size);
+                overlay = new Form();
+                overlay.FormBorderStyle = FormBorderStyle.None;
+                overlay.ShowInTaskbar = false;
+                overlay.StartPosition = FormStartPosition.Manual;
+                overlay.Bounds = area;
+                overlay.BackgroundImage = snapshot;
+                overlay.BackgroundImageLayout = ImageLayout.None;
+                overlay.Enabled = false;
+                overlay.Show(this);
+            }
+        }
+        catch
+        {
+            if (overlay != null) overlay.Dispose();
+            overlay = null;
+        }
+        darkMode = !darkMode;
+        ApplyTheme();
+        Refresh();
+        if (overlay == null)
+        {
+            if (snapshot != null) snapshot.Dispose();
+            return;
+        }
+        Form fading = overlay;
+        Bitmap picture = snapshot;
+        Motion.Run(fading, 420, delegate(double t) { if (!fading.IsDisposed) fading.Opacity = 1 - t; },
+            delegate { fading.Close(); fading.Dispose(); picture.Dispose(); Activate(); }, Motion.EaseInOut);
     }
 
     // ===================== Aviso rápido no app =====================
@@ -6042,15 +6577,16 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private void ShowToast(string title, string detail, string revealPath)
     {
         bool dark = darkMode;
-        Color surface = dark ? Color.FromArgb(45, 45, 45) : Color.White;
+        Color surface = Theme.Surface;
         toastPanel.BackColor = surface;
         toastTitle.BackColor = surface;
         toastDetail.BackColor = surface;
-        toastTitle.ForeColor = dark ? Color.FromArgb(52, 211, 153) : Color.FromArgb(5, 150, 105);
-        toastDetail.ForeColor = dark ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        toastTitle.ForeColor = Theme.Fg;
+        toastDetail.ForeColor = Theme.Muted;
+        toastPanel.BorderColor = Theme.Line;
         toastButton.BackColor = surface;
-        toastButton.ForeColor = dark ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        toastButton.BorderColor = dark ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        toastButton.ForeColor = Theme.Fg;
+        toastButton.BorderColor = Theme.LineStrong;
         toastTitle.Text = title;
         toastDetail.Text = detail ?? "";
         toastRevealPath = revealPath;
@@ -6058,18 +6594,23 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         toastButton.Text = "Abrir pasta";
         toastButton.Visible = revealPath != null;
         toastTimer.Interval = 4500;
-        // Fica na faixa de baixo, à esquerda do botão Baixar.
-        int finalTop = downloadButton.Top - 4;
-        toastPanel.SetBounds(28, finalTop + 16, 520, 46);
-        toastPanel.Enabled = true;
+        // Fica na faixa de baixo, à esquerda do botão Baixar. Entra subindo com efeito de mola.
+        int finalTop = downloadButton.Top - 2;
+        toastPanel.Elevated = true;
+        toastPanel.SetBounds(28, finalTop + 26, 520, 48);
         toastPanel.Visible = true;
         toastPanel.BringToFront();
-        // Desliza para cima com um leve "quique" no final.
-        int startTop = finalTop + 16;
-        Motion.Run(toastMotion, 360, delegate(double t)
+        Color titleColor = toastTitle.ForeColor;
+        Color detailColor = toastDetail.ForeColor;
+        toastTitle.ForeColor = surface;
+        toastDetail.ForeColor = surface;
+        Motion.FadeText(toastTitle, titleColor, 300);
+        Motion.FadeText(toastDetail, detailColor, 380);
+        Motion.Run(toastPanel, 520, delegate(double t)
         {
-            toastPanel.Top = startTop + (int)Math.Round((finalTop - startTop) * t);
-        }, null, Motion.EaseOutBack);
+            if (!toastPanel.IsDisposed) toastPanel.Top = finalTop + (int)Math.Round(26 * (1 - t));
+        }, null, Motion.Spring);
+        brandMark.Bounce();
         toastTimer.Stop();
         toastTimer.Start();
     }
@@ -6149,15 +6690,19 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     {
         toastTimer.Stop();
         toastRevealPath = null;
-        toastAction = null;
         if (!toastPanel.Visible) return;
-        // Sai deslizando para baixo; não aceita cliques enquanto some.
-        toastPanel.Enabled = false;
+        // Sai descendo e desbotando.
         int startTop = toastPanel.Top;
-        Motion.Run(toastMotion, 180, delegate(double t)
+        Color surface = toastPanel.BackColor;
+        Color titleColor = toastTitle.ForeColor;
+        Color detailColor = toastDetail.ForeColor;
+        Motion.Run(toastPanel, 240, delegate(double t)
         {
-            toastPanel.Top = startTop + (int)Math.Round(16 * t);
-        }, delegate { toastPanel.Visible = false; toastPanel.Enabled = true; }, Motion.EaseInOutCubic);
+            if (toastPanel.IsDisposed) return;
+            toastPanel.Top = startTop + (int)Math.Round(22 * t);
+            toastTitle.ForeColor = Motion.Mix(titleColor, surface, t);
+            toastDetail.ForeColor = Motion.Mix(detailColor, surface, t);
+        }, delegate { if (!toastPanel.IsDisposed) toastPanel.Visible = false; }, Motion.EaseIn);
     }
 
     // ===================== Link copiado =====================
@@ -6289,75 +6834,51 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     // ===================== Conversor de arquivos (vídeo, áudio e imagem) =====================
 
     private static readonly string[] ConverterImageInputs = new string[] { ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".ico", ".jfif", ".avif", ".heic" };
+    // Formatos de saída por tipo de arquivo. Cada arquivo só mostra os formatos do próprio tipo:
+    // vídeo → formatos de vídeo, música → formatos de áudio, imagem → formatos de imagem.
     private static readonly string[] ConverterKinds = new string[] { "video", "audio", "image" };
-
-    // Só formatos que fazem sentido para cada tipo de arquivo.
-    private static string[] ConverterTargetsFor(string kind)
+    private static readonly string[] ConverterImageCodecs = new string[] { "mjpeg", "png", "bmp", "webp", "gif", "tiff", "jpegls", "jpeg2000", "pam", "ppm", "qoi", "targa" };
+    private static readonly string[] ConverterAudioExtensions = new string[]
     {
-        if (kind == "image") return new string[] { "PNG · imagem", "JPG · imagem", "WEBP · imagem", "BMP · imagem", "ICO · ícone" };
-        if (kind == "audio") return new string[] { "MP3 · áudio", "M4A · áudio", "AAC · áudio", "WAV · áudio", "FLAC · áudio", "OGG · áudio", "OPUS · áudio" };
-        return new string[]
-        {
-            "MP4 · vídeo", "MKV · vídeo", "MOV · vídeo", "WEBM · vídeo", "AVI · vídeo", "GIF · animação",
-            "MP3 · só o áudio", "M4A · só o áudio", "AAC · só o áudio", "WAV · só o áudio", "FLAC · só o áudio", "OGG · só o áudio", "OPUS · só o áudio"
-        };
+        ".mp3", ".m4a", ".wav", ".flac", ".opus", ".ogg", ".oga", ".aac", ".wma", ".aiff", ".aif", ".alac", ".mka", ".m4b", ".amr", ".ac3", ".mp2", ".caf", ".ape", ".wv"
+    };
+    private static readonly string[] ConverterVideoExtensions = new string[]
+    {
+        ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".wmv", ".flv", ".3gp", ".ts", ".mts", ".m2ts", ".mpg", ".mpeg", ".ogv", ".vob", ".f4v", ".asf", ".mxf", ".divx"
+    };
+
+    private static string[] ConverterFormatsFor(string kind)
+    {
+        if (kind == "image") return new string[] { "PNG", "JPG", "WEBP", "BMP", "ICO" };
+        if (kind == "audio") return new string[] { "MP3", "M4A", "AAC", "WAV", "FLAC", "OGG", "OPUS" };
+        return new string[] { "MP4", "MKV", "MOV", "WEBM", "AVI", "GIF" };
     }
 
-    private static string ConverterKindLabel(string kind, int count)
+    // Monta o nome interno do destino (ex.: "MP4 · vídeo"), usado pelo montador de comandos do FFmpeg.
+    private static string ConverterTarget(string kind, string format)
+    {
+        if (kind == "image") return format == "ICO" ? "ICO · ícone" : format + " · imagem";
+        if (kind == "audio") return format + " · áudio";
+        return format == "GIF" ? "GIF · animação" : format + " · vídeo";
+    }
+
+    private static string ConverterKindTitle(string kind, int count)
     {
         string n = count.ToString(CultureInfo.InvariantCulture);
-        if (kind == "image") return "▣  " + (count == 1 ? "1 imagem" : n + " imagens");
-        if (kind == "audio") return "♪  " + (count == 1 ? "1 música/áudio" : n + " músicas/áudios");
-        return "▶  " + (count == 1 ? "1 vídeo" : n + " vídeos");
+        if (kind == "image") return count == 1 ? "1 imagem" : n + " imagens";
+        if (kind == "audio") return count == 1 ? "1 áudio" : n + " áudios";
+        return count == 1 ? "1 vídeo" : n + " vídeos";
     }
 
     private static string ConverterKindGlyph(string kind)
     {
-        return kind == "image" ? "IMG" : kind == "audio" ? "♪" : "▶";
+        return kind == "image" ? "▣" : kind == "audio" ? "♪" : kind == "video" ? "▶" : "?";
     }
 
-    // Um "vídeo" sem imagem (ex.: .mp4 só com áudio) é tratado como áudio, para mostrar as opções certas.
-    private static string EffectiveKind(ConvertItem item)
+    private static string SourceFormat(ConvertItem item)
     {
-        if (item.Kind == "video" && item.Probed && item.VideoCodec == null && item.AudioCodec != null) return "audio";
-        return item.Kind;
-    }
-
-    private static string ConvertItemDetails(ConvertItem item)
-    {
-        if (!item.Probed || item.Kind == "image") return "";
-        List<string> parts = new List<string>();
-        if (item.Duration > 0) parts.Add(FormatTime((int)Math.Round(item.Duration)));
-        if (item.VideoCodec != null) parts.Add(item.VideoCodec.ToUpperInvariant());
-        if (item.AudioCodec != null) parts.Add(item.AudioCodec.ToUpperInvariant());
-        return String.Join(" · ", parts.ToArray());
-    }
-
-    // Miniatura para o card do conversor: a própria imagem, um quadro do vídeo ou a capa da música.
-    private Bitmap MakeConvertThumbnail(ConvertItem item)
-    {
-        string kind = EffectiveKind(item);
-        if (kind == "audio" && !item.CoverOnly) return null;
-        string temp = Path.Combine(Path.GetTempPath(), "ytd-thumb-" + Guid.NewGuid().ToString("N") + ".png");
-        try
-        {
-            string input = "-i \"" + item.Path + "\"";
-            string tail = " -an -frames:v 1 -vf \"scale=144:-2\" \"" + temp + "\"";
-            bool ok = kind == "video"
-                ? RunFfmpeg("-ss 1 " + input + tail) || RunFfmpeg(input + tail)
-                : RunFfmpeg(input + tail);
-            if (!ok || !File.Exists(temp)) return null;
-            byte[] bytes = File.ReadAllBytes(temp);
-            using (MemoryStream stream = new MemoryStream(bytes))
-            using (Image image = Image.FromStream(stream))
-                return new Bitmap(image);
-        }
-        catch { return null; }
-        finally
-        {
-            try { if (File.Exists(temp)) File.Delete(temp); }
-            catch { }
-        }
+        string ext = Path.GetExtension(item.Path).TrimStart('.').ToUpperInvariant();
+        return ext == "JPEG" || ext == "JFIF" ? "JPG" : ext == "TIF" ? "TIFF" : ext;
     }
 
     private static bool? nvencAvailable;
@@ -6375,13 +6896,14 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         return "video";
     }
 
+    // Primeiro palpite pela extensão. Arquivos desconhecidos ficam "unknown" até o ffprobe olhar o conteúdo.
     private static string InputKind(string path)
     {
         string extension = Path.GetExtension(path).ToLowerInvariant();
         if (Array.IndexOf(ConverterImageInputs, extension) >= 0) return "image";
-        if (extension == ".mp3" || extension == ".m4a" || extension == ".wav" || extension == ".flac" || extension == ".opus" ||
-            extension == ".ogg" || extension == ".aac" || extension == ".wma" || extension == ".aiff" || extension == ".alac") return "audio";
-        return "video";
+        if (Array.IndexOf(ConverterAudioExtensions, extension) >= 0) return "audio";
+        if (Array.IndexOf(ConverterVideoExtensions, extension) >= 0) return "video";
+        return "unknown";
     }
 
     // Detecta uma vez se a placa de vídeo NVIDIA pode codificar (bem mais rápido que o processador).
@@ -6419,7 +6941,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                     else if (line.StartsWith("codec_type="))
                     {
                         string type = line.Substring(11);
-                        if (type == "video" && item.VideoCodec == null && codec != "mjpeg" && codec != "png") item.VideoCodec = codec;
+                        if (type == "video" && item.VideoCodec == null && Array.IndexOf(ConverterImageCodecs, codec) < 0) item.VideoCodec = codec;
                         else if (type == "video" && item.VideoCodec == null) item.CoverOnly = true;
                         else if (type == "audio" && item.AudioCodec == null) item.AudioCodec = codec;
                         codec = null;
@@ -6582,307 +7104,383 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     private bool IsCompatible(ConvertItem item, string target)
     {
         string kind = TargetKind(target);
-        if (item.Kind == "image") return kind == "image";
-        if (kind == "image") return false;
-        if (kind == "video") return item.Kind == "video" && (!item.Probed || item.VideoCodec != null);
-        return !item.Probed || item.AudioCodec != null;
+        if (item.Kind != kind) return false;
+        if (kind == "video") return item.VideoCodec != null;
+        if (kind == "audio") return item.AudioCodec != null;
+        return true;
+    }
+
+    // Depois do ffprobe, decide o tipo pelo conteúdo de verdade (ex.: um .mp4 só com som vira "áudio",
+    // um arquivo com extensão estranha que é uma foto vira "imagem").
+    private static void ClassifyConvertItem(ConvertItem item)
+    {
+        if (item.Kind == "image") return;
+        if (item.VideoCodec != null) item.Kind = "video";
+        else if (item.AudioCodec != null) item.Kind = "audio";
+        else if (item.CoverOnly) item.Kind = "image";
+        else item.Kind = "none";
+    }
+
+    // Miniatura do card: a própria imagem, um quadro do vídeo ou a capa da música.
+    private Bitmap MakeConvertThumbnail(ConvertItem item)
+    {
+        if (item.Kind == "none" || (item.Kind == "audio" && !item.CoverOnly)) return null;
+        string extension = Path.GetExtension(item.Path).ToLowerInvariant();
+        if (item.Kind == "image" && (extension == ".jpg" || extension == ".jpeg" || extension == ".jfif" || extension == ".png" ||
+            extension == ".bmp" || extension == ".gif" || extension == ".tif" || extension == ".tiff" || extension == ".ico"))
+        {
+            try
+            {
+                using (MemoryStream stream = new MemoryStream(File.ReadAllBytes(item.Path)))
+                using (Image original = Image.FromStream(stream))
+                    return (Bitmap)MakeSmallThumbnail(original, 160);
+            }
+            catch { }
+        }
+        string temp = Path.Combine(Path.GetTempPath(), "ytd-thumb-" + Guid.NewGuid().ToString("N") + ".png");
+        try
+        {
+            string input = "-i \"" + item.Path + "\"";
+            string tail = " -an -map 0:v:0 -frames:v 1 -vf \"scale=160:-2\" \"" + temp + "\"";
+            bool ok = item.Kind == "video"
+                ? RunFfmpeg("-ss 1 " + input + tail) || RunFfmpeg(input + tail)
+                : RunFfmpeg(input + tail);
+            if (!ok || !File.Exists(temp)) return null;
+            using (MemoryStream stream = new MemoryStream(File.ReadAllBytes(temp)))
+            using (Image image = Image.FromStream(stream))
+                return new Bitmap(image);
+        }
+        catch { return null; }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch { }
+        }
     }
 
     private void ShowConverter(object sender, EventArgs e)
     {
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
-        Color border = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
-        Color accent = Color.FromArgb(16, 185, 129);
-        Color accentText = darkMode ? Color.FromArgb(52, 211, 153) : Color.FromArgb(5, 150, 105);
-        Color danger = darkMode ? Color.FromArgb(248, 113, 113) : Color.FromArgb(220, 38, 38);
-        // Mesmo vidro da janela principal.
-        Color cardColor = darkMode ? Color.FromArgb(40, 40, 46) : Color.White;
-        int cardAlpha = darkMode ? 165 : 170;
-        int buttonAlpha = darkMode ? 140 : 180;
-        Color glassBorder = darkMode ? Color.FromArgb(40, 255, 255, 255) : Color.FromArgb(120, 148, 163, 184);
+        Color background = Theme.Bg;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
+        Color faintText = Theme.Faint;
+        Color danger = Theme.Danger;
+        Color okColor = Theme.Ok;
+        const int W = 640;
+        const int CardHeight = 72;
 
-        GlassForm dialog = new GlassForm(darkMode);
-        Motion.FadeIn(dialog);
+        Form dialog = new Form();
         dialog.Text = "Converter arquivos";
         dialog.StartPosition = FormStartPosition.CenterParent;
         dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
         dialog.MaximizeBox = false;
         dialog.MinimizeBox = false;
         dialog.ShowInTaskbar = false;
-        dialog.ClientSize = new Size(600, 522);
+        dialog.ClientSize = new Size(W, 420);
         dialog.Font = Font;
+        dialog.BackColor = background;
         dialog.ForeColor = mainText;
         dialog.AllowDrop = true;
+        dialog.KeyPreview = true;
+        Buffering.Enable(dialog);
         ApplyWindowChrome(dialog);
+        Motion.FadeIn(dialog);
 
         Label heading = new Label();
         heading.Text = "Converter arquivos";
-        heading.Font = new Font("Segoe UI", 16F, FontStyle.Bold);
+        heading.Font = Theme.Semibold(15F);
         heading.AutoSize = true;
-        heading.BackColor = Color.Transparent;
         heading.Location = new Point(22, 18);
         dialog.Controls.Add(heading);
 
         Label subtitle = new Label();
-        subtitle.Text = "Vídeos, músicas e imagens · arraste os arquivos para esta janela";
+        subtitle.Text = "Cada arquivo mostra só os formatos que fazem sentido para ele.";
         subtitle.ForeColor = mutedText;
         subtitle.AutoSize = true;
-        subtitle.BackColor = Color.Transparent;
-        subtitle.Location = new Point(24, 52);
+        subtitle.Location = new Point(24, 50);
         dialog.Controls.Add(subtitle);
 
+        DropZone dropZone = new DropZone();
+        dropZone.Title = "Arraste vídeos, músicas ou imagens para cá";
+        dropZone.Hint = "ou clique para escolher no seu PC";
+        dropZone.Font = Font;
+        dialog.Controls.Add(dropZone);
+
         FlowLayoutPanel list = new FlowLayoutPanel();
-        list.SetBounds(18, 82, 564, 290);
         list.AutoScroll = true;
         list.FlowDirection = FlowDirection.TopDown;
         list.WrapContents = false;
-        list.BackColor = Color.Transparent;
-        list.Padding = new Padding(2);
+        list.BackColor = background;
+        list.Padding = new Padding(0, 2, 0, 2);
         list.AllowDrop = true;
-        Glass.EnableDoubleBuffer(list);
-        // Ao rolar, redesenha tudo para o vidro dos cards acompanhar o fundo.
-        list.Scroll += delegate { list.Invalidate(true); };
-        list.MouseWheel += delegate { list.Invalidate(true); };
+        list.Visible = false;
+        Buffering.Enable(list);
         dialog.Controls.Add(list);
-
-        Label empty = new Label();
-        empty.Text = "Arraste vídeos, músicas ou imagens para cá\r\nou clique em + Adicionar arquivos.";
-        empty.ForeColor = mutedText;
-        empty.BackColor = Color.Transparent;
-        empty.TextAlign = ContentAlignment.MiddleCenter;
-        empty.Size = new Size(536, 260);
-        empty.Margin = new Padding(0, 10, 0, 0);
-        list.Controls.Add(empty);
 
         RoundedButton addButton = new RoundedButton(10);
         addButton.Text = "+  Adicionar arquivos";
-        addButton.SetBounds(18, 382, 168, 36);
         addButton.BackColor = surface;
         addButton.ForeColor = mainText;
-        addButton.BorderColor = glassBorder;
-        addButton.GlassAlpha = buttonAlpha;
+        addButton.BorderColor = Theme.LineStrong;
         dialog.Controls.Add(addButton);
 
         RoundedButton clearButton = new RoundedButton(10);
         clearButton.Text = "Limpar lista";
-        clearButton.SetBounds(194, 382, 110, 36);
-        clearButton.BackColor = surface;
-        clearButton.ForeColor = mainText;
-        clearButton.BorderColor = glassBorder;
-        clearButton.GlassAlpha = buttonAlpha;
+        clearButton.Look = ButtonLook.Ghost;
+        clearButton.BackColor = background;
+        clearButton.ForeColor = mutedText;
+        clearButton.HoverForeColor = mainText;
         dialog.Controls.Add(clearButton);
 
         Label targetLabel = new Label();
-        targetLabel.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
-        targetLabel.ForeColor = mainText;
-        targetLabel.BackColor = Color.Transparent;
+        targetLabel.Text = "CONVERTER PARA";
+        targetLabel.Font = Theme.Semibold(7.75F);
+        targetLabel.ForeColor = faintText;
         targetLabel.AutoSize = true;
-        targetLabel.Location = new Point(22, 432);
+        targetLabel.Visible = false;
         dialog.Controls.Add(targetLabel);
 
-        // Um seletor por tipo de arquivo presente na lista; cada um só mostra formatos que fazem sentido para aquele tipo.
+        // Uma linha por tipo presente na lista, cada uma só com os formatos daquele tipo.
+        Dictionary<string, Label> kindLabels = new Dictionary<string, Label>();
+        Dictionary<string, SegmentedControl> kindSwitches = new Dictionary<string, SegmentedControl>();
         Dictionary<string, string> savedSettings = ReadSettings();
-        string legacyTarget;
-        savedSettings.TryGetValue("convert-target", out legacyTarget);
-        Dictionary<string, ComboBox> targetBoxes = new Dictionary<string, ComboBox>();
-        Dictionary<string, RoundedPanel> targetSurfaces = new Dictionary<string, RoundedPanel>();
-        Dictionary<string, Label> targetNames = new Dictionary<string, Label>();
         foreach (string kind in ConverterKinds)
         {
-            Label kindName = new Label();
-            kindName.ForeColor = mainText;
-            kindName.BackColor = Color.Transparent;
-            kindName.TextAlign = ContentAlignment.MiddleLeft;
-            kindName.AutoEllipsis = true;
-            kindName.Visible = false;
-            dialog.Controls.Add(kindName);
-            targetNames[kind] = kindName;
+            Label label = new Label();
+            label.Font = Theme.Semibold(9.5F);
+            label.ForeColor = mainText;
+            label.AutoEllipsis = true;
+            label.TextAlign = ContentAlignment.MiddleLeft;
+            label.Visible = false;
+            dialog.Controls.Add(label);
+            kindLabels[kind] = label;
 
-            RoundedPanel targetSurface = new RoundedPanel(10);
-            targetSurface.BackColor = surface;
-            targetSurface.BorderColor = border;
-            targetSurface.Visible = false;
-            ComboBox box = new ComboBox();
-            box.DropDownStyle = ComboBoxStyle.DropDownList;
-            box.FlatStyle = FlatStyle.Flat;
-            box.BackColor = surface;
-            box.ForeColor = mainText;
-            box.MaxDropDownItems = 16;
-            string[] options = ConverterTargetsFor(kind);
-            box.Items.AddRange(options);
-            box.SetBounds(12, 4, 236, 26);
-            targetSurface.Controls.Add(box);
-            dialog.Controls.Add(targetSurface);
-            targetSurfaces[kind] = targetSurface;
-            targetBoxes[kind] = box;
-
-            string saved;
-            if (savedSettings.TryGetValue("convert-target-" + kind, out saved) && box.Items.IndexOf(saved) >= 0) box.SelectedItem = saved;
-            else if (legacyTarget != null && box.Items.IndexOf(legacyTarget) >= 0) box.SelectedItem = legacyTarget;
-            else box.SelectedIndex = 0;
+            SegmentedControl formats = new SegmentedControl();
+            formats.Items = ConverterFormatsFor(kind);
+            formats.Font = Theme.Semibold(8.75F);
+            formats.AccentPill = true;
+            formats.TrackColor = Theme.Dark ? Theme.Sunken : Theme.Track;
+            formats.TextColor = mutedText;
+            formats.SelectedTextColor = Theme.OnAccent;
+            formats.Visible = false;
+            dialog.Controls.Add(formats);
+            kindSwitches[kind] = formats;
         }
 
         Label status = new Label();
         status.Text = "Os arquivos convertidos ficam na mesma pasta dos originais.";
         status.ForeColor = mutedText;
-        status.BackColor = Color.Transparent;
         status.AutoEllipsis = true;
+        status.TextAlign = ContentAlignment.MiddleLeft;
         dialog.Controls.Add(status);
 
-        RoundedButton convertButton = new RoundedButton(14);
+        RoundedButton convertButton = new RoundedButton(12);
         convertButton.Text = "Converter";
-        convertButton.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-        convertButton.BackColor = accent;
-        convertButton.ForeColor = Color.White;
+        convertButton.Font = Theme.Semibold(10F);
+        convertButton.BackColor = Theme.Accent;
+        convertButton.ForeColor = Theme.OnAccent;
+        convertButton.Look = ButtonLook.Primary;
         convertButton.Enabled = false;
         dialog.Controls.Add(convertButton);
 
         List<ConvertItem> items = new List<ConvertItem>();
         List<Image> thumbnails = new List<Image>();
+        Dictionary<ConvertItem, RoundedPanel> cards = new Dictionary<ConvertItem, RoundedPanel>();
         Dictionary<ConvertItem, RoundedThumbnail> itemThumbs = new Dictionary<ConvertItem, RoundedThumbnail>();
-        Dictionary<ConvertItem, Label> itemNotes = new Dictionary<ConvertItem, Label>();
+        Dictionary<ConvertItem, Label> itemInfo = new Dictionary<ConvertItem, Label>();
+        HashSet<string> initializedKinds = new HashSet<string>();
         bool running = false;
         bool closing = false;
+        bool adjusting = false;
         Timer uiTimer = new Timer();
         uiTimer.Interval = 200;
-        object resizeKey = new object();
-        string shownKinds = null;
-        HashSet<string> userPicked = new HashSet<string>();
-        HashSet<string> suggested = new HashSet<string>();
-        bool adjusting = false;
+        object layoutKey = new object();
+        double shownListHeight = 0;
+        string shownSignature = null;
 
-        Func<ConvertItem, string> targetOf = delegate(ConvertItem item)
+        Func<ConvertItem, string> formatOf = delegate(ConvertItem item)
         {
-            ComboBox box = targetBoxes[EffectiveKind(item)];
-            return box.SelectedItem == null ? box.Items[0].ToString() : box.SelectedItem.ToString();
+            SegmentedControl formats;
+            if (!kindSwitches.TryGetValue(item.Kind, out formats) || formats.SelectedItem == null) return null;
+            return formats.SelectedItem;
         };
 
-        // Mostra só os seletores dos tipos que estão na lista e ajusta a altura da janela (com animação).
+        // Posiciona tudo a partir da altura (animada) da lista. Devolve a altura total da janela.
+        Func<double, List<string>, int> place = delegate(double listHeight, List<string> present)
+        {
+            int listH = (int)Math.Round(listHeight);
+            int top = 82;
+            bool hasItems = items.Count > 0;
+            dropZone.Visible = !hasItems;
+            list.Visible = hasItems;
+            if (hasItems) list.SetBounds(16, top, W - 32, Math.Max(1, listH));
+            else dropZone.SetBounds(22, top, W - 44, Math.Max(1, listH));
+            int y = top + listH + 12;
+            addButton.SetBounds(22, y, 170, 36);
+            clearButton.SetBounds(198, y, 110, 36);
+            clearButton.Visible = hasItems;
+            y += 52;
+            targetLabel.Visible = present.Count > 0;
+            targetLabel.Location = new Point(24, y);
+            if (present.Count > 0) y += 22;
+            foreach (string kind in ConverterKinds)
+            {
+                bool show = present.Contains(kind);
+                kindLabels[kind].Visible = show;
+                kindSwitches[kind].Visible = show;
+                if (!show) continue;
+                kindLabels[kind].SetBounds(22, y, 150, 36);
+                kindSwitches[kind].SetBounds(178, y, W - 200, 36);
+                y += 44;
+            }
+            y += present.Count > 0 ? 6 : 0;
+            status.SetBounds(22, y, W - 200, 44);
+            convertButton.SetBounds(W - 172, y, 152, 48);
+            return y + 64;
+        };
+
         Action relayout = delegate
         {
             List<string> present = new List<string>();
             Dictionary<string, int> counts = new Dictionary<string, int>();
             foreach (ConvertItem item in items)
             {
-                string kind = EffectiveKind(item);
                 int count;
-                counts.TryGetValue(kind, out count);
-                counts[kind] = count + 1;
+                counts.TryGetValue(item.Kind, out count);
+                counts[item.Kind] = count + 1;
             }
-            foreach (string kind in ConverterKinds) if (counts.ContainsKey(kind)) present.Add(kind);
-            // Quando um tipo aparece pela primeira vez, sugere um formato diferente do que os arquivos já são
-            // (ex.: MP3 não sugere "virar MP3"). Nunca muda o que a pessoa escolheu.
-            foreach (string kind in present)
-            {
-                if (suggested.Contains(kind) || userPicked.Contains(kind)) continue;
-                bool allProbed = true;
-                HashSet<string> sourceExtensions = new HashSet<string>();
-                foreach (ConvertItem item in items)
-                {
-                    if (!item.Probed) allProbed = false;
-                    if (EffectiveKind(item) == kind) sourceExtensions.Add(Path.GetExtension(item.Path).TrimStart('.').ToLowerInvariant());
-                }
-                if (!allProbed) continue;
-                suggested.Add(kind);
-                ComboBox box = targetBoxes[kind];
-                if (box.SelectedItem == null || !sourceExtensions.Contains(TargetExtension(box.SelectedItem.ToString()))) continue;
-                foreach (object option in box.Items)
-                {
-                    string ext = TargetExtension(option.ToString());
-                    if (sourceExtensions.Contains(ext) || (ext == "jpg" && sourceExtensions.Contains("jpeg"))) continue;
-                    adjusting = true;
-                    box.SelectedItem = option;
-                    adjusting = false;
-                    break;
-                }
-            }
-            int y = 456;
             foreach (string kind in ConverterKinds)
             {
-                bool show = counts.ContainsKey(kind);
-                targetNames[kind].Visible = show;
-                targetSurfaces[kind].Visible = show;
-                if (!show) continue;
-                targetNames[kind].Text = ConverterKindLabel(kind, counts[kind]);
-                targetNames[kind].SetBounds(22, y, 290, 34);
-                targetSurfaces[kind].SetBounds(322, y, 260, 34);
-                y += 42;
+                if (!counts.ContainsKey(kind)) continue;
+                present.Add(kind);
+                kindLabels[kind].Text = ConverterKindGlyph(kind) + "   " + ConverterKindTitle(kind, counts[kind]);
             }
-            targetLabel.Text = present.Count == 0 ? "Adicione arquivos para ver as opções de conversão." : "Converter para";
-            targetLabel.Font = present.Count == 0 ? new Font("Segoe UI", 9F) : new Font("Segoe UI", 9.5F, FontStyle.Bold);
-            targetLabel.ForeColor = present.Count == 0 ? mutedText : mainText;
-            int bottom = present.Count == 0 ? 456 : y;
-            status.SetBounds(22, bottom + 12, 400, 36);
-            convertButton.SetBounds(442, bottom + 8, 140, 42);
-
-            string signature = String.Join(",", present.ToArray());
-            int targetHeight = bottom + 66;
-            if (signature == shownKinds && dialog.ClientSize.Height == targetHeight) return;
-            shownKinds = signature;
-            int from = dialog.ClientSize.Height;
-            if (!dialog.Visible || from == targetHeight)
+            double targetList = items.Count == 0 ? 190 : Math.Min(4, items.Count) * (CardHeight + 8) + 6;
+            string signature = String.Join(",", present.ToArray()) + "|" + targetList.ToString(CultureInfo.InvariantCulture);
+            if (signature == shownSignature) return;
+            shownSignature = signature;
+            double from = shownListHeight;
+            if (!dialog.Visible || from == 0)
             {
-                dialog.ClientSize = new Size(600, targetHeight);
+                shownListHeight = targetList;
+                dialog.ClientSize = new Size(W, place(targetList, present));
                 return;
             }
-            Motion.Run(resizeKey, 240, delegate(double t)
+            Motion.Run(layoutKey, 380, delegate(double t)
             {
-                if (!dialog.IsDisposed) dialog.ClientSize = new Size(600, from + (int)Math.Round((targetHeight - from) * t));
-            }, null, Motion.EaseInOutCubic);
+                if (dialog.IsDisposed) return;
+                shownListHeight = from + (targetList - from) * t;
+                Redraw.Suspend(dialog);
+                int height;
+                try { height = place(shownListHeight, present); }
+                finally { Redraw.Resume(dialog); }
+                dialog.ClientSize = new Size(W, height);
+            }, null, Motion.EaseOut);
+        };
+
+        // Escolhe o formato inicial de cada tipo: o último usado, mas nunca o mesmo formato dos arquivos.
+        Action initializeKinds = delegate
+        {
+            foreach (string kind in ConverterKinds)
+            {
+                if (initializedKinds.Contains(kind)) continue;
+                ConvertItem first = items.Find(delegate(ConvertItem i) { return i.Kind == kind; });
+                if (first == null) continue;
+                initializedKinds.Add(kind);
+                SegmentedControl formats = kindSwitches[kind];
+                string source = SourceFormat(first);
+                string saved;
+                int choice = -1;
+                if (savedSettings.TryGetValue("convert-format-" + kind, out saved) && saved != source) choice = Array.IndexOf(formats.Items, saved);
+                if (choice < 0)
+                    for (int i = 0; i < formats.Items.Length; i++)
+                        if (formats.Items[i] != source) { choice = i; break; }
+                adjusting = true;
+                formats.SelectedIndex = Math.Max(0, choice);
+                adjusting = false;
+            }
         };
 
         Action refreshCards = delegate
         {
+            initializeKinds();
             relayout();
             int ready = 0;
             foreach (ConvertItem item in items)
             {
-                string line;
+                string text;
                 Color color = mutedText;
-                string target = targetOf(item);
+                string format = formatOf(item);
                 if (item.Done && item.Output != null)
                 {
-                    line = item.Lossless ? "✓  Pronto · instantâneo, sem perda de qualidade" : "✓  Pronto · " + Path.GetFileName(item.Output);
-                    color = accentText;
+                    text = item.Lossless ? "✓  Pronto · instantâneo, sem perder qualidade" : "✓  Pronto · " + Path.GetFileName(item.Output);
+                    color = okColor;
                 }
-                else if (item.Done) { line = "✗  Não deu certo" + (String.IsNullOrEmpty(item.Error) ? "" : " · " + item.Error); color = danger; }
-                else if (item.Running) line = item.Duration > 0 ? "Convertendo… " + ((int)item.Percent).ToString(CultureInfo.InvariantCulture) + "%" : "Convertendo…";
-                else if (!item.Probed) line = "Analisando…";
-                else if (!IsCompatible(item, target))
-                {
-                    line = item.VideoCodec == null && item.AudioCodec == null ? "Este arquivo não tem vídeo nem áudio que dê para converter"
-                        : "Não dá para converter este arquivo para " + TargetExtension(target).ToUpperInvariant();
-                    color = danger;
-                }
-                else { line = "Pronto para virar " + TargetExtension(target).ToUpperInvariant(); ready++; }
-                if (item.StatusLabel.Text != line) item.StatusLabel.Text = line;
+                else if (item.Done) { text = "✗  Não deu certo" + (String.IsNullOrEmpty(item.Error) ? "" : " · " + item.Error); color = danger; }
+                else if (item.Running) text = item.Duration > 0 ? "Convertendo…  " + ((int)item.Percent).ToString(CultureInfo.InvariantCulture) + "%" : "Convertendo…";
+                else if (!item.Probed) text = "Analisando o arquivo…";
+                else if (item.Kind == "none") { text = "Não reconheci este arquivo como vídeo, música ou imagem"; color = danger; }
+                else if (format == null) text = "Escolha o formato abaixo";
+                else if (format == SourceFormat(item)) { text = "Já está em " + format + " · escolha outro formato abaixo"; color = Theme.Warn; }
+                else if (!IsCompatible(item, ConverterTarget(item.Kind, format))) { text = "Não dá para converter este arquivo para " + format; color = danger; }
+                else { text = "Vai virar  " + format; ready++; }
+                if (item.StatusLabel.Text != text) item.StatusLabel.Text = text;
                 item.StatusLabel.ForeColor = color;
-                item.Bar.Visible = item.Running;
+                item.Bar.Visible = item.Running || (item.Done && item.Output != null && item.Bar.Value > 0);
+                item.Bar.Active = item.Running;
                 item.Bar.Value = (int)item.Percent;
-                Label note;
-                if (itemNotes.TryGetValue(item, out note))
+                Label info;
+                if (itemInfo.TryGetValue(item, out info))
                 {
-                    string details = ConvertItemDetails(item);
-                    if (note.Text != details) note.Text = details;
+                    List<string> parts = new List<string>();
+                    if (item.Probed && item.Duration > 0 && item.Kind != "image") parts.Add(FormatTime((int)Math.Round(item.Duration)));
+                    string source = SourceFormat(item);
+                    if (item.VideoCodec != null && item.Kind == "video" && item.VideoCodec.ToUpperInvariant() != source) parts.Add(item.VideoCodec.ToUpperInvariant());
+                    if (item.AudioCodec != null && item.Kind != "image" && item.AudioCodec.ToUpperInvariant() != source) parts.Add(item.AudioCodec.ToUpperInvariant());
+                    string details = String.Join(" · ", parts.ToArray());
+                    string line = (String.IsNullOrEmpty(details) ? "" : details + "  ·  ") + info.Tag;
+                    if (info.Text != line) info.Text = line;
                 }
                 RoundedThumbnail thumb;
-                if (itemThumbs.TryGetValue(item, out thumb) && thumb.Image == null)
-                {
-                    string glyph = ConverterKindGlyph(EffectiveKind(item));
-                    if (thumb.PlaceholderText != glyph) { thumb.PlaceholderText = glyph; thumb.Invalidate(); }
-                }
+                if (itemThumbs.TryGetValue(item, out thumb) && thumb.Image == null && item.Probed && !thumb.Loading)
+                    thumb.PlaceholderText = ConverterKindGlyph(item.Kind);
             }
             convertButton.Enabled = !running && ready > 0;
             convertButton.Text = running ? "Convertendo…" : (ready > 1 ? "Converter (" + ready.ToString(CultureInfo.InvariantCulture) + ")" : "Converter");
             addButton.Enabled = !running;
             clearButton.Enabled = !running && items.Count > 0;
-            foreach (ComboBox box in targetBoxes.Values) box.Enabled = !running;
+            foreach (SegmentedControl formats in kindSwitches.Values) formats.Enabled = !running;
+        };
+
+        Action<ConvertItem> removeItem = null;
+        removeItem = delegate(ConvertItem item)
+        {
+            if (running || !items.Contains(item)) return;
+            items.Remove(item);
+            RoundedPanel card = cards[item];
+            cards.Remove(item);
+            itemThumbs.Remove(item);
+            itemInfo.Remove(item);
+            int startHeight = card.Height;
+            // O card encolhe e some antes de sair da lista.
+            Motion.Run(card, 220, delegate(double t)
+            {
+                if (!card.IsDisposed) card.Height = Math.Max(1, (int)Math.Round(startHeight * (1 - t)));
+            }, delegate
+            {
+                list.Controls.Remove(card);
+                card.Dispose();
+                bool stillUsed = false;
+                foreach (ConvertItem other in items) if (other.Kind == item.Kind) stillUsed = true;
+                if (!stillUsed) initializedKinds.Remove(item.Kind);
+                refreshCards();
+            }, Motion.EaseIn);
         };
 
         Action<IEnumerable<string>> addFiles = delegate(IEnumerable<string> paths)
         {
+            int stagger = 0;
             foreach (string raw in paths)
             {
                 string path = raw.Trim().Trim('"');
@@ -6890,7 +7488,6 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 bool exists = false;
                 foreach (ConvertItem known in items) if (String.Equals(known.Path, path, StringComparison.OrdinalIgnoreCase)) exists = true;
                 if (exists) continue;
-                if (list.Controls.Contains(empty)) list.Controls.Remove(empty);
 
                 ConvertItem item = new ConvertItem();
                 item.Path = path;
@@ -6899,97 +7496,122 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 try { size = new FileInfo(path).Length; }
                 catch { }
 
+                int cardWidth = W - 32 - 22;
                 RoundedPanel card = new RoundedPanel(12);
-                card.SetBounds(0, 0, 532, 0);
-                card.Margin = new Padding(2, 2, 2, 7);
-                card.BackColor = cardColor;
-                card.GlassAlpha = cardAlpha;
-                card.BorderColor = glassBorder;
+                card.SetBounds(0, 0, cardWidth, 1);
+                card.Margin = new Padding(0, 0, 0, 8);
+                card.BackColor = surface;
+                card.BorderColor = Theme.Line;
+                card.Elevated = true;
 
-                // Miniatura de verdade (imagem, quadro do vídeo ou capa da música); até carregar, mostra um ícone do tipo.
                 RoundedThumbnail thumb = new RoundedThumbnail();
-                thumb.SetBounds(10, 10, 72, 48);
-                thumb.PlaceholderText = ConverterKindGlyph(item.Kind);
-                thumb.PlaceholderFontSize = 12F;
-                thumb.PlaceholderColor = darkMode ? Color.FromArgb(60, 60, 66) : Color.FromArgb(226, 232, 240);
-                thumb.PlaceholderTextColor = accentText;
+                thumb.SetBounds(12, 11, 80, 48);
+                thumb.Radius = 8;
+                thumb.PlaceholderColor = Theme.Dark ? Theme.Raised : Theme.Sunken;
+                thumb.PlaceholderTextColor = Theme.Accent;
+                thumb.PlaceholderFontSize = 14F;
+                thumb.Loading = true;
                 card.Controls.Add(thumb);
                 itemThumbs[item] = thumb;
 
                 Label name = new Label();
                 name.Text = Path.GetFileName(path);
-                name.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+                name.Font = Theme.Semibold(9.5F);
                 name.ForeColor = mainText;
-                name.BackColor = Color.Transparent;
                 name.AutoEllipsis = true;
-                name.SetBounds(94, 9, 300, 20);
+                name.SetBounds(104, 11, cardWidth - 104 - 44, 20);
                 card.Controls.Add(name);
 
-                Label info = new Label();
-                info.Text = Path.GetExtension(path).TrimStart('.').ToUpperInvariant() + "  ·  " + FormatSize(size);
-                info.Font = new Font("Segoe UI", 8.5F);
-                info.ForeColor = mutedText;
-                info.BackColor = Color.Transparent;
-                info.TextAlign = ContentAlignment.TopRight;
-                info.SetBounds(396, 11, 124, 18);
-                card.Controls.Add(info);
-
                 Label line = new Label();
-                line.Font = new Font("Segoe UI", 8.5F);
-                line.BackColor = Color.Transparent;
+                line.Font = new Font("Segoe UI", 8.75F);
                 line.AutoEllipsis = true;
-                line.SetBounds(94, 30, 280, 18);
+                line.SetBounds(104, 32, cardWidth - 104 - 16, 18);
                 card.Controls.Add(line);
                 item.StatusLabel = line;
 
-                Label note = new Label();
-                note.Font = new Font("Segoe UI", 8F);
-                note.ForeColor = mutedText;
-                note.BackColor = Color.Transparent;
-                note.TextAlign = ContentAlignment.TopRight;
-                note.AutoEllipsis = true;
-                note.SetBounds(376, 31, 144, 18);
-                card.Controls.Add(note);
-                itemNotes[item] = note;
+                Label info = new Label();
+                info.Tag = SourceFormat(item) + "  ·  " + FormatSize(size);
+                info.Text = (string)info.Tag;
+                info.Font = new Font("Segoe UI", 8F);
+                info.ForeColor = faintText;
+                info.AutoEllipsis = true;
+                info.SetBounds(104, 50, cardWidth - 104 - 16, 16);
+                card.Controls.Add(info);
+                itemInfo[item] = info;
+
+                RoundedButton remove = new RoundedButton(8);
+                remove.Text = "✕";
+                remove.Look = ButtonLook.Ghost;
+                remove.BackColor = surface;
+                remove.ForeColor = faintText;
+                remove.HoverForeColor = danger;
+                remove.Font = new Font("Segoe UI", 8.5F);
+                remove.SetBounds(cardWidth - 38, 8, 28, 26);
+                ConvertItem removable = item;
+                remove.Click += delegate { removeItem(removable); };
+                musicStatusTip.SetToolTip(remove, "Tirar da lista");
+                card.Controls.Add(remove);
 
                 PercentBar bar = new PercentBar();
-                bar.SetBounds(94, 54, 426, 4);
-                bar.TrackColor = darkMode ? Color.FromArgb(60, 255, 255, 255) : Color.FromArgb(70, 100, 116, 139);
-                bar.FillColor = accent;
+                bar.SetBounds(104, 52, cardWidth - 104 - 16, 4);
+                bar.TrackColor = Theme.Track;
+                bar.FillColor = Theme.Accent;
                 bar.Visible = false;
                 card.Controls.Add(bar);
                 item.Bar = bar;
 
                 list.Controls.Add(card);
                 items.Add(item);
-                // O card "abre" suavemente na lista.
+                cards[item] = card;
+
+                // O card "abre" na lista, um depois do outro (como no ForeverNote).
                 RoundedPanel growing = card;
-                Motion.Run(new object(), 220, delegate(double t)
+                int delay = stagger * 45;
+                stagger++;
+                Timer startLater = new Timer();
+                startLater.Interval = Math.Max(1, delay);
+                startLater.Tick += delegate
                 {
-                    if (!growing.IsDisposed) growing.Height = (int)Math.Round(68 * t);
-                }, null);
+                    startLater.Stop();
+                    startLater.Dispose();
+                    Motion.Run(growing, 420, delegate(double t)
+                    {
+                        if (!growing.IsDisposed) growing.Height = Math.Max(1, (int)Math.Round(CardHeight * t));
+                    }, null, Motion.Spring);
+                };
+                startLater.Start();
 
                 ConvertItem probeTarget = item;
                 if (item.Kind == "image") item.Probed = true;
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate
                 {
-                    if (probeTarget.Kind != "image") ProbeMedia(probeTarget);
+                    if (probeTarget.Kind != "image")
+                    {
+                        ProbeMedia(probeTarget);
+                        ClassifyConvertItem(probeTarget);
+                    }
                     if (closing) return;
+                    try { dialog.BeginInvoke((MethodInvoker)delegate { if (!dialog.IsDisposed && !closing) refreshCards(); }); }
+                    catch { }
                     Bitmap picture = MakeConvertThumbnail(probeTarget);
-                    if (dialog.IsDisposed) { if (picture != null) picture.Dispose(); return; }
                     try
                     {
                         dialog.BeginInvoke((MethodInvoker)delegate
                         {
-                            if (dialog.IsDisposed || closing) { if (picture != null) picture.Dispose(); return; }
                             RoundedThumbnail target;
-                            if (picture != null && itemThumbs.TryGetValue(probeTarget, out target) && !target.IsDisposed)
+                            if (dialog.IsDisposed || closing || !itemThumbs.TryGetValue(probeTarget, out target) || target.IsDisposed)
+                            {
+                                if (picture != null) picture.Dispose();
+                                return;
+                            }
+                            target.Loading = false;
+                            target.PlaceholderText = ConverterKindGlyph(probeTarget.Kind);
+                            if (picture != null)
                             {
                                 thumbnails.Add(picture);
                                 target.Image = picture;
                             }
-                            else if (picture != null) picture.Dispose();
-                            refreshCards();
+                            target.Invalidate();
                         });
                     }
                     catch { if (picture != null) picture.Dispose(); }
@@ -6998,77 +7620,106 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             refreshCards();
         };
 
-        DragEventHandler dragEnter = delegate(object s, DragEventArgs args)
+        Action pickFiles = delegate
         {
-            args.Effect = !running && args.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
-        };
-        DragEventHandler dragDrop = delegate(object s, DragEventArgs args)
-        {
-            string[] files = args.Data.GetData(DataFormats.FileDrop) as string[];
-            if (files != null && !running) addFiles(files);
-        };
-        dialog.DragEnter += dragEnter;
-        dialog.DragDrop += dragDrop;
-        list.DragEnter += dragEnter;
-        list.DragDrop += dragDrop;
-
-        addButton.Click += delegate
-        {
+            if (running) return;
             using (OpenFileDialog picker = new OpenFileDialog())
             {
                 picker.Title = "Escolha os arquivos para converter";
                 picker.Multiselect = true;
-                picker.Filter = "Vídeos, músicas e imagens|*" + String.Join(";*", LocalMediaExtensions) + ";*" + String.Join(";*", ConverterImageInputs) + "|Todos os arquivos|*.*";
+                List<string> all = new List<string>();
+                all.AddRange(ConverterVideoExtensions);
+                all.AddRange(ConverterAudioExtensions);
+                all.AddRange(ConverterImageInputs);
+                picker.Filter = "Vídeos, músicas e imagens|*" + String.Join(";*", all.ToArray()) +
+                    "|Vídeos|*" + String.Join(";*", ConverterVideoExtensions) +
+                    "|Músicas e áudios|*" + String.Join(";*", ConverterAudioExtensions) +
+                    "|Imagens|*" + String.Join(";*", ConverterImageInputs) + "|Todos os arquivos|*.*";
                 if (picker.ShowDialog(dialog) == DialogResult.OK) addFiles(picker.FileNames);
             }
         };
+
+        DragEventHandler dragEnter = delegate(object s, DragEventArgs args)
+        {
+            bool accept = !running && args.Data.GetDataPresent(DataFormats.FileDrop);
+            args.Effect = accept ? DragDropEffects.Copy : DragDropEffects.None;
+            if (accept) dropZone.Highlighted = true;
+        };
+        EventHandler dragLeave = delegate { dropZone.Highlighted = false; };
+        DragEventHandler dragDrop = delegate(object s, DragEventArgs args)
+        {
+            dropZone.Highlighted = false;
+            string[] files = args.Data.GetData(DataFormats.FileDrop) as string[];
+            if (files != null && !running) addFiles(files);
+        };
+        foreach (Control target in new Control[] { dialog, list, dropZone })
+        {
+            target.AllowDrop = true;
+            target.DragEnter += dragEnter;
+            target.DragLeave += dragLeave;
+            target.DragDrop += dragDrop;
+        }
+        dropZone.Click += delegate { pickFiles(); };
+        addButton.Click += delegate { pickFiles(); };
         clearButton.Click += delegate
         {
+            if (running) return;
             items.Clear();
+            cards.Clear();
+            itemThumbs.Clear();
+            itemInfo.Clear();
+            initializedKinds.Clear();
             while (list.Controls.Count > 0)
             {
                 Control old = list.Controls[0];
                 list.Controls.RemoveAt(0);
-                if (old != empty) old.Dispose();
+                old.Dispose();
             }
-            list.Controls.Add(empty);
-            itemThumbs.Clear();
-            itemNotes.Clear();
-            suggested.Clear();
             foreach (Image picture in thumbnails) picture.Dispose();
             thumbnails.Clear();
             status.Text = "Os arquivos convertidos ficam na mesma pasta dos originais.";
+            status.ForeColor = mutedText;
             refreshCards();
         };
-        foreach (KeyValuePair<string, ComboBox> pair in targetBoxes)
+        foreach (KeyValuePair<string, SegmentedControl> pair in kindSwitches)
         {
             string kind = pair.Key;
-            pair.Value.SelectedIndexChanged += delegate
+            SegmentedControl formats = pair.Value;
+            formats.SelectedIndexChanged += delegate
             {
-                if (adjusting) return;
-                userPicked.Add(kind);
+                if (!adjusting && formats.SelectedItem != null)
+                {
+                    savedSettings["convert-format-" + kind] = formats.SelectedItem;
+                    // Trocar o formato "zera" os itens já convertidos daquele tipo, para converter de novo se quiser.
+                    foreach (ConvertItem item in items)
+                        if (item.Kind == kind && item.Done) { item.Done = false; item.Output = null; item.Error = null; item.Percent = 0; }
+                }
                 refreshCards();
             };
         }
 
         convertButton.Click += delegate
         {
-            Dictionary<string, string> settings = ReadSettings();
-            foreach (KeyValuePair<string, ComboBox> pair in targetBoxes)
-                if (pair.Value.SelectedItem != null) settings["convert-target-" + pair.Key] = pair.Value.SelectedItem.ToString();
-            WriteSettings(settings);
-            // Cada arquivo usa o formato escolhido para o tipo dele.
-            Dictionary<ConvertItem, string> targets = new Dictionary<ConvertItem, string>();
             List<ConvertItem> work = new List<ConvertItem>();
+            Dictionary<ConvertItem, string> targets = new Dictionary<ConvertItem, string>();
             foreach (ConvertItem item in items)
             {
-                string target = targetOf(item);
-                if (!item.Done && !item.Running && item.Probed && IsCompatible(item, target)) { work.Add(item); targets[item] = target; }
+                string format = formatOf(item);
+                if (item.Done || item.Running || !item.Probed || format == null || format == SourceFormat(item)) continue;
+                string target = ConverterTarget(item.Kind, format);
+                if (!IsCompatible(item, target)) continue;
+                work.Add(item);
+                targets[item] = target;
             }
             if (work.Count == 0) return;
+            Dictionary<string, string> settings = ReadSettings();
+            foreach (string kind in ConverterKinds)
+                if (kindSwitches[kind].Visible && kindSwitches[kind].SelectedItem != null) settings["convert-format-" + kind] = kindSwitches[kind].SelectedItem;
+            WriteSettings(settings);
             running = true;
             DateTime started = DateTime.Now;
             status.Text = "Convertendo " + work.Count.ToString(CultureInfo.InvariantCulture) + (work.Count == 1 ? " arquivo…" : " arquivos…");
+            status.ForeColor = mutedText;
             uiTimer.Start();
             refreshCards();
             System.Threading.ThreadPool.QueueUserWorkItem(delegate
@@ -7078,6 +7729,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                 {
                     if (closing) return;
                     item.Running = true;
+                    item.Error = null;
                     bool ok = false;
                     try { ok = RunConvert(item, targets[item]); }
                     catch (Exception ex) { item.Error = ex.Message; }
@@ -7099,6 +7751,8 @@ internal sealed class DownloaderForm : Form, IGlassSurface
                         double seconds = (DateTime.Now - started).TotalSeconds;
                         status.Text = okCount.ToString(CultureInfo.InvariantCulture) + " de " + work.Count.ToString(CultureInfo.InvariantCulture) +
                             " convertidos em " + (seconds < 1 ? "menos de 1 s" : FormatTime((int)Math.Ceiling(seconds)));
+                        status.ForeColor = okCount == work.Count ? okColor : mutedText;
+                        Motion.FadeText(status, status.ForeColor, 320);
                         refreshCards();
                         if (okCount > 0)
                         {
@@ -7115,6 +7769,16 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         };
 
         uiTimer.Tick += delegate { refreshCards(); };
+        dialog.KeyDown += delegate(object s, KeyEventArgs args)
+        {
+            if (args.KeyCode == Keys.Escape && !running) dialog.Close();
+            else if (args.KeyCode == Keys.V && args.Control && !running && Clipboard.ContainsFileDropList())
+            {
+                List<string> pasted = new List<string>();
+                foreach (string file in Clipboard.GetFileDropList()) pasted.Add(file);
+                addFiles(pasted);
+            }
+        };
         dialog.FormClosing += delegate(object s, FormClosingEventArgs args)
         {
             if (!running) return;
@@ -7142,9 +7806,8 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         closing = true;
         uiTimer.Stop();
         uiTimer.Dispose();
-        foreach (Image picture in thumbnails) picture.Dispose();
-        thumbnails.Clear();
         dialog.Dispose();
+        foreach (Image picture in thumbnails) picture.Dispose();
     }
 
     // ===================== Fila de downloads (até 3 ao mesmo tempo) =====================
@@ -7718,6 +8381,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         progress.Value = 0;
         percentLabel.Text = "0%";
         progress.Visible = false;
+        progress.Active = false;
         percentLabel.Visible = false;
         queueProgressLabel.Visible = false;
         videoDetailsLabel.Text = queueCompleted > 0
@@ -7733,6 +8397,7 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         suppressBatchCountAfterReset = true;
         SetInputsEnabled(true);
         progress.Visible = false;
+        progress.Active = false;
         percentLabel.Visible = false;
         queueProgressLabel.Visible = false;
         videoDetailsLabel.Text = queueFailed == 0
@@ -7794,10 +8459,11 @@ internal sealed class DownloaderForm : Form, IGlassSurface
         videoTitleLabel.Text = "Cole um link para identificar o vídeo";
         videoDetailsLabel.Text = "A miniatura e os detalhes aparecerão aqui.";
         musicStatusLabel.Text = "Aguardando verificação musical";
-        musicStatusLabel.ForeColor = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
+        musicStatusLabel.ForeColor = Theme.Muted;
         queueButton.Text = "Fila (0)";
         queueButton.Enabled = false;
         progress.Visible = false;
+        progress.Active = false;
         percentLabel.Visible = false;
         queueProgressLabel.Visible = false;
         UpdateDownloadButton();
@@ -7816,15 +8482,16 @@ internal sealed class DownloaderForm : Form, IGlassSurface
     // Janela no estilo do app: mostra o que falhou e oferece "Tentar novamente".
     private bool AskRetryFailures(string summary, int failedCount)
     {
-        Color background = darkMode ? Color.FromArgb(31, 31, 31) : Color.FromArgb(241, 245, 249);
-        Color surface = darkMode ? Color.FromArgb(45, 45, 45) : Color.White;
-        Color mainText = darkMode ? Color.FromArgb(245, 245, 245) : Color.FromArgb(15, 23, 42);
-        Color mutedText = darkMode ? Color.FromArgb(170, 170, 170) : Color.FromArgb(100, 116, 139);
-        Color border = darkMode ? Color.FromArgb(70, 70, 70) : Color.FromArgb(203, 213, 225);
+        Color background = Theme.Bg;
+        Color surface = Theme.Surface;
+        Color mainText = Theme.Fg;
+        Color mutedText = Theme.Muted;
+        Color border = Theme.LineStrong;
         bool result = false;
         using (Form dialog = new Form())
         {
             Motion.FadeIn(dialog);
+            Buffering.Enable(dialog);
             dialog.Text = "Fila concluída";
             dialog.StartPosition = FormStartPosition.CenterParent;
             dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -7881,8 +8548,9 @@ internal sealed class DownloaderForm : Form, IGlassSurface
             retryButton.Text = "Tentar novamente";
             retryButton.SetBounds(352, 276, 128, 38);
             retryButton.Font = new Font("Segoe UI", 9F, FontStyle.Bold);
-            retryButton.BackColor = Color.FromArgb(16, 185, 129);
-            retryButton.ForeColor = Color.White;
+            retryButton.BackColor = Theme.Accent;
+            retryButton.ForeColor = Theme.OnAccent;
+            retryButton.Look = ButtonLook.Primary;
             retryButton.Click += delegate { result = true; dialog.Close(); };
             dialog.Controls.Add(retryButton);
 

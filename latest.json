@@ -1,5 +1,5 @@
 {
-  "version": "5.0",
-  "notes": "Visual novo com fundo translúcido, cards de vidro e animações suaves. Conversor mais inteligente: mostra só os formatos que fazem sentido para cada tipo de arquivo, com miniaturas.",
-  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v5.0/YT-Downloader.exe"
+  "version": "6.0",
+  "notes": "Visual novo inspirado no ForeverNote, com animações suaves que funcionam sempre. Conversor mostra só os formatos do tipo de cada arquivo. Prévia do link quase instantânea e novo modo Baixar ao colar.",
+  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v6.0/YT-Downloader.exe"
 }
