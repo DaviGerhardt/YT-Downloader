@@ -1,5 +1,5 @@
 {
-  "version": "6.0",
-  "notes": "Visual novo inspirado no ForeverNote, com animações suaves que funcionam sempre. Conversor mostra só os formatos do tipo de cada arquivo. Prévia do link quase instantânea e novo modo Baixar ao colar.",
-  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v6.0/YT-Downloader.exe"
+  "version": "6.1",
+  "notes": "Downloads do YouTube mais confiáveis: o app agora traz o motor que resolve as proteções do YouTube e tenta outro caminho sozinho quando aparece o aviso de robô. Mensagens de erro em português.",
+  "url": "https://github.com/DaviGerhardt/YT-Downloader/releases/download/v6.1/YT-Downloader.exe"
 }

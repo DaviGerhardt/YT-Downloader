@@ -2179,11 +2179,12 @@ internal sealed class DownloadJob
     public DateTime LastBytesAt;
     public double MeasuredSpeed;
     public double SectionSeconds;
+    public bool UseFallback;
 }
 
 internal sealed class DownloaderForm : Form
 {
-    internal const string AppVersion = "6.0";
+    internal const string AppVersion = "6.1";
     private readonly Label versionLabel = new Label();
     private readonly BrandMark brandMark = new BrandMark();
     private readonly SegmentedControl typeSwitch = new SegmentedControl();
@@ -2315,6 +2316,40 @@ internal sealed class DownloaderForm : Form
     private bool updatingTrimUi;
 
     private string AppFolder { get { return Program.RuntimeDirectory; } }
+
+    // ===================== Ajustes comuns do yt-dlp =====================
+    // Depois de um bloqueio "não é um robô" resolvido pelo caminho alternativo, os próximos pedidos já usam esse caminho
+    // (sem perder tempo tentando de novo o que o YouTube está barrando nesta internet).
+    private static volatile bool youtubeFallbackActive;
+    private const string YouTubeFallbackArgs = "--extractor-args \"youtube:player_client=tv,mweb,web_safari\" ";
+
+    // Opções que vão em todo comando do yt-dlp: o Deno embutido (resolve o "quebra-cabeça" do YouTube) e,
+    // se preciso, o caminho alternativo. Sem o Deno pronto, nada muda.
+    private static string YtDlpExtraArgs(bool fallback)
+    {
+        string args = "";
+        if (Program.DenoReady) args += "--js-runtimes " + Quote("deno:" + Program.DenoPath) + " ";
+        if (fallback) args += YouTubeFallbackArgs;
+        return args;
+    }
+
+    private static void PrepareYtDlpEnvironment(ProcessStartInfo info)
+    {
+        info.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        info.EnvironmentVariables["PYTHONUTF8"] = "1";
+        info.EnvironmentVariables["DENO_NO_UPDATE_CHECK"] = "1";
+        info.EnvironmentVariables["DENO_NO_PROMPT"] = "1";
+    }
+
+    // "Sign in to confirm you're not a bot": o YouTube desconfiou da internet de quem está baixando.
+    private static bool IsBotCheckError(string text)
+    {
+        if (String.IsNullOrEmpty(text)) return false;
+        string lower = text.ToLowerInvariant();
+        return lower.Contains("not a bot") || lower.Contains("confirm you") || lower.Contains("confirm that you");
+    }
+
+    private const string BotCheckMessage = "O YouTube pediu para confirmar que não é um robô. Desligue VPN/proxy, tente outra internet ou espere um pouco.";
 
     // Ícone com todos os tamanhos (16 a 256 px): fica nítido na barra de título, na barra de tarefas e perto do relógio.
     private static Icon LoadAppIcon()
@@ -3955,7 +3990,7 @@ internal sealed class DownloaderForm : Form
             process.StartInfo.RedirectStandardError = true;
             process.StartInfo.StandardOutputEncoding = Encoding.UTF8;
             process.StartInfo.StandardErrorEncoding = Encoding.UTF8;
-            process.StartInfo.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+            PrepareYtDlpEnvironment(process.StartInfo);
             DataReceivedEventHandler collect = delegate(object source, DataReceivedEventArgs received)
             {
                 if (received.Data == null) return;
@@ -4049,7 +4084,9 @@ internal sealed class DownloaderForm : Form
         ProcessStartInfo fetch = new ProcessStartInfo();
         fetch.FileName = downloader;
         fetch.Arguments = "--no-playlist --no-warnings --quiet --no-progress --no-part --no-mtime --socket-timeout 15 --retries 2 " +
-            "--concurrent-fragments 4 -f \"ba[abr<=96]/wa/ba/b\" -o \"" + template + "\" " + Quote(link);
+            "--concurrent-fragments 4 -f \"ba[abr<=96]/wa/ba/b\" " + YtDlpExtraArgs(youtubeFallbackActive && IsYouTubeHost(link)) +
+            "-o \"" + template + "\" " + Quote(link);
+        PrepareYtDlpEnvironment(fetch);
         fetch.WorkingDirectory = AppFolder;
         fetch.UseShellExecute = false;
         fetch.CreateNoWindow = true;
@@ -5172,35 +5209,51 @@ internal sealed class DownloaderForm : Form
             : null;
         try
         {
-            ProcessStartInfo info = new ProcessStartInfo();
-            info.FileName = downloader;
-            info.Arguments = "--dump-single-json --skip-download --no-playlist --no-warnings --socket-timeout 15 --retries 1 " + Quote(url);
-            info.WorkingDirectory = AppFolder;
-            info.UseShellExecute = false;
-            info.CreateNoWindow = true;
-            info.RedirectStandardOutput = true;
-            info.RedirectStandardError = true;
-            info.StandardOutputEncoding = Encoding.UTF8;
-            info.StandardErrorEncoding = Encoding.UTF8;
-            using (Process process = Process.Start(info))
+            string json = null;
+            string errors = "";
+            bool fallback = youtubeFallbackActive && IsYouTubeHost(url);
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                Task<string> stdout = Task.Factory.StartNew(delegate { return process.StandardOutput.ReadToEnd(); });
-                Task<string> stderr = Task.Factory.StartNew(delegate { return process.StandardError.ReadToEnd(); });
-                process.WaitForExit();
-                Task.WaitAll(stdout, stderr);
-                if (process.ExitCode != 0 || String.IsNullOrWhiteSpace(stdout.Result))
+                ProcessStartInfo info = new ProcessStartInfo();
+                info.FileName = downloader;
+                info.Arguments = "--dump-single-json --skip-download --no-playlist --no-warnings --socket-timeout 15 --retries 1 " +
+                    YtDlpExtraArgs(fallback) + Quote(url);
+                info.WorkingDirectory = AppFolder;
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardOutput = true;
+                info.RedirectStandardError = true;
+                info.StandardOutputEncoding = Encoding.UTF8;
+                info.StandardErrorEncoding = Encoding.UTF8;
+                PrepareYtDlpEnvironment(info);
+                using (Process process = Process.Start(info))
                 {
-                    result.Details = CompactError(stderr.Result);
-                    return result;
+                    Task<string> stdout = Task.Factory.StartNew(delegate { return process.StandardOutput.ReadToEnd(); });
+                    Task<string> stderr = Task.Factory.StartNew(delegate { return process.StandardError.ReadToEnd(); });
+                    process.WaitForExit();
+                    Task.WaitAll(stdout, stderr);
+                    errors = stderr.Result;
+                    if (process.ExitCode == 0 && !String.IsNullOrWhiteSpace(stdout.Result)) { json = stdout.Result; break; }
                 }
+                // Bloqueio de robô no YouTube: tenta uma vez pelo caminho alternativo.
+                if (fallback || !IsYouTubeHost(url) || !IsBotCheckError(errors)) break;
+                fallback = true;
+            }
+            if (json == null)
+            {
+                result.Details = CompactError(errors);
+                return result;
+            }
+            if (fallback && IsYouTubeHost(url)) youtubeFallbackActive = true;
+            {
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
                 serializer.MaxJsonLength = 20 * 1024 * 1024;
-                Dictionary<string, object> metadata = serializer.Deserialize<Dictionary<string, object>>(stdout.Result);
+                Dictionary<string, object> metadata = serializer.Deserialize<Dictionary<string, object>>(json);
                 try
                 {
                     Directory.CreateDirectory(previewDirectory);
                     string infoPath = Path.Combine(previewDirectory, PreviewKey(url) + ".info.json");
-                    File.WriteAllText(infoPath, stdout.Result, new UTF8Encoding(false));
+                    File.WriteAllText(infoPath, json, new UTF8Encoding(false));
                     result.InfoJsonPath = infoPath;
                     result.FetchedAt = DateTime.Now;
                 }
@@ -5717,6 +5770,7 @@ internal sealed class DownloaderForm : Form
     private static string CompactError(string text)
     {
         if (String.IsNullOrWhiteSpace(text)) return "Não foi possível concluir.";
+        if (IsBotCheckError(text)) return BotCheckMessage;
         string[] lines = text.Trim().Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
         string last = lines.Length == 0 ? text.Trim() : lines[lines.Length - 1].Trim();
         return last.Length > 150 ? last.Substring(0, 147) + "…" : last;
@@ -5766,7 +5820,8 @@ internal sealed class DownloaderForm : Form
         {
             ProcessStartInfo info = new ProcessStartInfo();
             info.FileName = downloader;
-            info.Arguments = "--flat-playlist --print id --no-warnings " + Quote(playlistUrl);
+            info.Arguments = "--flat-playlist --print id --no-warnings " + YtDlpExtraArgs(youtubeFallbackActive) + Quote(playlistUrl);
+            PrepareYtDlpEnvironment(info);
             info.WorkingDirectory = AppFolder;
             info.UseShellExecute = false;
             info.CreateNoWindow = true;
@@ -8005,6 +8060,7 @@ internal sealed class DownloaderForm : Form
             if (job.Spec.Subtitles)
                 args += " --write-subs --sub-langs " + Quote("pt.*,en.*") + " --embed-subs";
         }
+        args += " " + YtDlpExtraArgs(job.UseFallback).TrimEnd();
         // Com a identificação guardada, o download começa direto (sem consultar o site de novo).
         if (!String.IsNullOrEmpty(job.InfoJson)) return args + " --load-info-json " + Quote(job.InfoJson);
         return args + " " + Quote(job.Url);
@@ -8032,6 +8088,7 @@ internal sealed class DownloaderForm : Form
         if (known != null && !String.IsNullOrEmpty(known.InfoJsonPath) && File.Exists(known.InfoJsonPath) &&
             (DateTime.Now - known.FetchedAt).TotalHours < 3)
             job.InfoJson = known.InfoJsonPath;
+        job.UseFallback = !job.Spec.IsLocal && youtubeFallbackActive && IsYouTubeHost(job.Url);
         job.Args = job.Spec.IsLocal ? "" : BuildDownloadArgs(job);
         job.LastActivity = DateTime.Now;
         job.LastBytesAt = DateTime.Now;
@@ -8075,7 +8132,7 @@ internal sealed class DownloaderForm : Form
             catch { }
             return;
         }
-        for (int attempt = 0; attempt < 2; attempt++)
+        for (int attempt = 0; attempt < 3; attempt++)
         {
         try
         {
@@ -8083,6 +8140,7 @@ internal sealed class DownloaderForm : Form
             {
                 process.StartInfo.FileName = downloader;
                 process.StartInfo.Arguments = job.Args;
+                PrepareYtDlpEnvironment(process.StartInfo);
                 process.StartInfo.WorkingDirectory = AppFolder;
                 process.StartInfo.UseShellExecute = false;
                 process.StartInfo.CreateNoWindow = true;
@@ -8114,9 +8172,21 @@ internal sealed class DownloaderForm : Form
             error = ex.Message;
             lock (job.Lock) job.Process = null;
         }
-        if (exitCode == 0 || String.IsNullOrEmpty(job.InfoJson) || queueCancelled || job.TimedOut) break;
-        // A identificação guardada pode ter expirado: tenta de novo consultando o site.
-        job.InfoJson = null;
+        if (exitCode == 0 || queueCancelled || job.TimedOut) break;
+        string failure;
+        lock (job.Lock) failure = job.Errors.ToString();
+        if (!job.UseFallback && IsYouTubeHost(job.Url) && IsBotCheckError(failure))
+        {
+            // Bloqueio de robô: tenta pelo caminho alternativo (e os próximos downloads já vão direto por ele).
+            job.UseFallback = true;
+            job.InfoJson = null;
+        }
+        else if (!String.IsNullOrEmpty(job.InfoJson))
+        {
+            // A identificação guardada pode ter expirado: tenta de novo consultando o site.
+            job.InfoJson = null;
+        }
+        else break;
         job.Args = BuildDownloadArgs(job);
         lock (job.Lock)
         {
@@ -8127,6 +8197,7 @@ internal sealed class DownloaderForm : Form
         }
         job.LastActivity = DateTime.Now;
         }
+        if (exitCode == 0 && job.UseFallback) youtubeFallbackActive = true;
         lock (job.Lock) if (exitCode != 0 && job.Errors.Length > 0) error = job.Errors.ToString();
         if (job.TimedOut)
         {
@@ -8810,6 +8881,64 @@ internal static class Program
         }
     }
 
+    // Deno: "ajudante" que o yt-dlp usa para resolver o quebra-cabeça em JavaScript do YouTube.
+    // Vai embutido no app e é extraído em segundo plano (não atrasa a abertura nem os downloads).
+    internal static string DenoPath { get { return Path.Combine(Path.Combine(RuntimeDirectory, "deno"), "deno.exe"); } }
+    private static volatile bool denoReady;
+    internal static bool DenoReady { get { return denoReady; } }
+
+    internal static void PrepareDenoInBackground()
+    {
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            try
+            {
+                if (Assembly.GetExecutingAssembly().GetManifestResourceInfo("YTDownloader.Resources.deno.zip") == null) return;
+                string folder = Path.Combine(RuntimeDirectory, "deno");
+                string marker = Path.Combine(folder, "versao.txt");
+                string expected = DenoBundleVersion();
+                bool current = File.Exists(DenoPath) && File.Exists(marker) && File.ReadAllText(marker).Trim() == expected;
+                if (!current)
+                {
+                    if (Directory.Exists(folder)) Directory.Delete(folder, true);
+                    ExtractZipResource("YTDownloader.Resources.deno.zip", folder, "deno.exe");
+                    File.WriteAllText(marker, expected);
+                    try
+                    {
+                        using (Stream license = Assembly.GetExecutingAssembly().GetManifestResourceStream("YTDownloader.Resources.LICENSE-Deno.txt"))
+                        using (FileStream output = File.Create(Path.Combine(RuntimeDirectory, "LICENSE-Deno.txt")))
+                            if (license != null) license.CopyTo(output);
+                    }
+                    catch { }
+                }
+                // Confere se o Deno abre neste PC; só então o yt-dlp passa a usá-lo.
+                ProcessStartInfo info = new ProcessStartInfo();
+                info.FileName = DenoPath;
+                info.Arguments = "--version";
+                info.UseShellExecute = false;
+                info.CreateNoWindow = true;
+                info.RedirectStandardOutput = true;
+                info.EnvironmentVariables["DENO_NO_UPDATE_CHECK"] = "1";
+                using (Process process = Process.Start(info))
+                {
+                    process.StandardOutput.ReadToEnd();
+                    if (process.WaitForExit(20000) && process.ExitCode == 0) denoReady = true;
+                }
+            }
+            catch { }
+        });
+    }
+
+    private static string DenoBundleVersion()
+    {
+        try
+        {
+            using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("YTDownloader.Resources.deno.zip"))
+                return stream == null ? "" : stream.Length.ToString(CultureInfo.InvariantCulture);
+        }
+        catch { return ""; }
+    }
+
     internal static void CleanupOldEngines(string keep)
     {
         try
@@ -8838,6 +8967,7 @@ internal static class Program
                 "YT Downloader", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
+        PrepareDenoInBackground();
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new DownloaderForm());

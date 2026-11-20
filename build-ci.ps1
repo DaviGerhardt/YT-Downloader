@@ -14,12 +14,28 @@ if ($code -notmatch ('AppVersion = "' + [regex]::Escape($ver) + '"')) {
   throw "A versao do latest.json ($ver) e a AppVersion do codigo nao batem."
 }
 
+# Deno (motor JavaScript que o yt-dlp usa no YouTube). Versao fixa da linha LTS; vai embutido no .exe.
+$denoVersion = '2.9.7'
+$denoZip = Join-Path $dist 'deno.zip'
+$denoUrl = "https://github.com/denoland/deno/releases/download/v$denoVersion/deno-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest -Uri $denoUrl -OutFile $denoZip -UseBasicParsing
+$denoCheck = Join-Path $dist 'deno-check'
+Expand-Archive -Path $denoZip -DestinationPath $denoCheck -Force
+$denoReported = & (Join-Path $denoCheck 'deno.exe') --version
+if ($LASTEXITCODE -ne 0 -or -not ($denoReported -match [regex]::Escape($denoVersion))) { throw "O Deno baixado nao funcionou." }
+Remove-Item -Recurse -Force $denoCheck
+$denoLicense = Join-Path $dist 'LICENSE-Deno.txt'
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/denoland/deno/v$denoVersion/LICENSE.md" -OutFile $denoLicense -UseBasicParsing
+Write-Host "Deno $denoVersion OK"
+
 $exe = Join-Path $dist 'YT-Downloader.exe'
 $cscArgs = @('/nologo','/target:winexe','/optimize+','/platform:anycpu',
   "/out:$exe", "/win32icon:$(Join-Path $src 'YTDownloader.ico')",
   '/r:System.dll','/r:System.Core.dll','/r:System.Drawing.dll','/r:System.Windows.Forms.dll','/r:System.Web.Extensions.dll',
   '/r:System.IO.Compression.dll','/r:System.IO.Compression.FileSystem.dll',
   "/resource:$(Join-Path $src 'YTDownloader.ico'),YTDownloader.Resources.app.ico",
+  "/resource:$denoZip,YTDownloader.Resources.deno.zip",
+  "/resource:$denoLicense,YTDownloader.Resources.LICENSE-Deno.txt",
   "/resource:$(Join-Path $res 'yt-dlp_win.zip'),YTDownloader.Resources.yt-dlp_win.zip",
   "/resource:$(Join-Path $res 'ffmpeg.exe.gz'),YTDownloader.Resources.ffmpeg.exe.gz",
   "/resource:$(Join-Path $res 'ffprobe.exe.gz'),YTDownloader.Resources.ffprobe.exe.gz",
