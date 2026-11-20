@@ -66,6 +66,12 @@ internal sealed class QueueVideoInfo
     public DateTime FetchedAt;
 }
 
+internal sealed class MusicSectionInfo
+{
+    public bool? HasSection;
+    public string Text;
+}
+
 internal sealed class TrimTargetItem
 {
     public string Link;
@@ -2184,7 +2190,7 @@ internal sealed class DownloadJob
 
 internal sealed class DownloaderForm : Form
 {
-    internal const string AppVersion = "6.1";
+    internal const string AppVersion = "6.2";
     private readonly Label versionLabel = new Label();
     private readonly BrandMark brandMark = new BrandMark();
     private readonly SegmentedControl typeSwitch = new SegmentedControl();
@@ -5204,8 +5210,8 @@ internal sealed class DownloaderForm : Form
             return result;
         }
         // A checagem de "Música" do YouTube roda ao mesmo tempo que o yt-dlp (antes era uma depois da outra).
-        Task<bool?> musicCheck = IsYouTubeHost(url)
-            ? Task.Factory.StartNew<bool?>(delegate { return DetectYoutubeMusicSection(url); })
+        Task<MusicSectionInfo> musicCheck = IsYouTubeHost(url)
+            ? Task.Factory.StartNew<MusicSectionInfo>(delegate { return DetectYoutubeMusicSection(url); })
             : null;
         try
         {
@@ -5258,15 +5264,18 @@ internal sealed class DownloaderForm : Form
                     result.FetchedAt = DateTime.Now;
                 }
                 catch { }
-                bool? musicSection = null;
+                MusicSectionInfo section = null;
                 if (musicCheck != null)
                 {
-                    try { musicSection = musicCheck.Wait(12000) ? musicCheck.Result : null; }
-                    catch { musicSection = null; }
+                    try { section = musicCheck.Wait(12000) ? musicCheck.Result : null; }
+                    catch { section = null; }
                 }
+                bool? musicSection = section == null ? null : section.HasSection;
                 result.HasMusicCredit = musicSection == true || (musicSection != false && HasMusicCredit(metadata))
                     ? (bool?)true
                     : musicSection;
+                // Pistas extras (lista de canais liberados, Creative Commons, créditos e gravadora) — só mudam o veredito, nada novo na tela.
+                result.HasMusicCredit = RefineCopyrightVerdict(result.HasMusicCredit, metadata, section);
                 result.Title = JsonString(metadata, "title");
                 object durationValue;
                 double durationSeconds;
@@ -5620,8 +5629,9 @@ internal sealed class DownloaderForm : Form
         catch { if (image != null) image.Dispose(); }
     }
 
-    private bool? DetectYoutubeMusicSection(string url)
+    private MusicSectionInfo DetectYoutubeMusicSection(string url)
     {
+        MusicSectionInfo info = new MusicSectionInfo();
         try
         {
             using (TimeoutWebClient client = new TimeoutWebClient())
@@ -5629,14 +5639,139 @@ internal sealed class DownloaderForm : Form
                 client.Encoding = Encoding.UTF8;
                 client.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36");
                 string html = client.DownloadString(url);
-                if (html.IndexOf("videoDescriptionMusicSectionRenderer", StringComparison.Ordinal) >= 0) return true;
-
-                object initialData = ExtractInitialData(html);
-                if (initialData == null) return null;
-                return HasYoutubeMusicRenderer(initialData);
+                bool marker = html.IndexOf("videoDescriptionMusicSectionRenderer", StringComparison.Ordinal) >= 0;
+                object initialData = ExtractJsonAfterMarker(html, "ytInitialData");
+                if (initialData != null)
+                {
+                    // Guarda o texto da seção Música (artista, álbum, "Licenciado para o YouTube por …") para checar a gravadora.
+                    StringBuilder text = new StringBuilder();
+                    CollectMusicSectionText(initialData, false, text);
+                    info.Text = text.ToString();
+                    info.HasSection = marker || HasYoutubeMusicRenderer(initialData);
+                    return info;
+                }
+                if (marker) { info.HasSection = true; return info; }
+                object playerData = ExtractJsonAfterMarker(html, "ytInitialPlayerResponse");
+                if (playerData != null) info.HasSection = HasYoutubeMusicRenderer(playerData);
+                return info;
             }
         }
-        catch { return null; }
+        catch { return info; }
+    }
+
+    // Junta todos os textos de dentro da seção Música da página.
+    private static void CollectMusicSectionText(object node, bool inside, StringBuilder text)
+    {
+        if (text.Length > 20000) return;
+        Dictionary<string, object> dictionary = node as Dictionary<string, object>;
+        if (dictionary != null)
+        {
+            foreach (KeyValuePair<string, object> pair in dictionary)
+            {
+                bool nowInside = inside || pair.Key == "videoDescriptionMusicSectionRenderer" ||
+                    (pair.Key == "horizontalCardListRenderer" && IsMusicCardList(pair.Value));
+                if (nowInside && (pair.Key == "simpleText" || pair.Key == "text" || pair.Key == "content") && pair.Value is string)
+                    text.Append(' ').Append((string)pair.Value);
+                else CollectMusicSectionText(pair.Value, nowInside, text);
+            }
+            return;
+        }
+        object[] array = node as object[];
+        if (array != null)
+            foreach (object item in array) CollectMusicSectionText(item, inside, text);
+    }
+
+    // ===================== Direitos autorais: pistas extras =====================
+    // Canais e selos que liberam o uso das músicas em vídeos (normalmente com crédito). Comparação sem espaços/acentos.
+    private static readonly string[] FreeMusicChannels = new string[]
+    {
+        "nocopyrightsounds", "ncs", "streambeats", "streambeatsbyharrisheller", "argofox", "kevinmacleod", "incompetech",
+        "pixabay", "pixabaymusic", "bensound", "audiolibrarymusicforcontentcreators", "audiolibrary", "vlognocopyrightmusic",
+        "lakeyinspired", "joakimkarud", "ikson", "djquads", "mbb", "mbbmusic"
+    };
+
+    // Créditos desses selos que aparecem na descrição de vídeos de outros canais (ex.: "Music provided by NoCopyrightSounds").
+    private static readonly string[] FreeMusicCredits = new string[]
+    {
+        "nocopyrightsounds", "ncs.io", "ncs release", "streambeats", "argofox", "incompetech", "kevin macleod",
+        "bensound", "pixabay.com", "lakey inspired", "lakeyinspired", "joakim karud", "audio library", "vlog no copyright music"
+    };
+
+    // Gravadoras/distribuidoras grandes na seção Música = direitos autorais com certeza.
+    private static readonly string[] MajorMusicLicensors = new string[]
+    {
+        "umg", "universal music", "sme", "sony music", "wmg", "warner", "believe", "the orchard", "bmg", "kobalt",
+        "emi", "adrev", "merlin", "sonymusic", "som livre", "virgin"
+    };
+
+    private static string NormalizeName(string value)
+    {
+        if (String.IsNullOrEmpty(value)) return "";
+        StringBuilder result = new StringBuilder();
+        foreach (char c in value.Normalize(NormalizationForm.FormD))
+            if (Char.IsLetterOrDigit(c) && CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+                result.Append(Char.ToLowerInvariant(c));
+        return result.ToString();
+    }
+
+    private static bool ContainsWord(string text, string word)
+    {
+        int index = 0;
+        while ((index = text.IndexOf(word, index, StringComparison.Ordinal)) >= 0)
+        {
+            bool startOk = index == 0 || !Char.IsLetterOrDigit(text[index - 1]);
+            int end = index + word.Length;
+            bool endOk = end >= text.Length || !Char.IsLetterOrDigit(text[end]);
+            if (startOk && endOk) return true;
+            index = end;
+        }
+        return false;
+    }
+
+    // Só o trecho "Licenciado para o YouTube por …" (o nome da música ou do artista não entra).
+    private static string LicensingLines(string sectionText)
+    {
+        StringBuilder result = new StringBuilder();
+        foreach (string phrase in new string[] { "licensed to youtube by", "licenciado para o youtube por", "licenciado para youtube por", "licencias otorgadas a youtube por" })
+        {
+            int index = 0;
+            while ((index = sectionText.IndexOf(phrase, index, StringComparison.Ordinal)) >= 0)
+            {
+                int start = index + phrase.Length;
+                result.Append(' ').Append(sectionText.Substring(start, Math.Min(240, sectionText.Length - start)));
+                index = start;
+            }
+        }
+        return result.ToString();
+    }
+
+    private static bool? RefineCopyrightVerdict(bool? current, Dictionary<string, object> metadata, MusicSectionInfo section)
+    {
+        try
+        {
+            // 1) Música licenciada por gravadora grande: protegida, mesmo com outras pistas.
+            string sectionText = section == null || section.Text == null ? "" : section.Text.ToLowerInvariant();
+            string licensing = LicensingLines(sectionText);
+            foreach (string licensor in MajorMusicLicensors)
+                if (ContainsWord(licensing, licensor)) return true;
+
+            // 2) Canal da lista de liberados.
+            foreach (string key in new string[] { "channel", "uploader", "uploader_id", "creator" })
+            {
+                string name = NormalizeName(JsonString(metadata, key));
+                if (name.Length > 0 && Array.IndexOf(FreeMusicChannels, name) >= 0) return false;
+            }
+
+            // 3) Licença Creative Commons marcada no YouTube.
+            if (JsonString(metadata, "license").IndexOf("creative commons", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+
+            // 4) Crédito de um selo liberado na descrição ou na seção Música (frases genéricas como "No Copyright" não contam).
+            string credits = (JsonString(metadata, "description") + " " + sectionText).ToLowerInvariant();
+            foreach (string credit in FreeMusicCredits)
+                if (ContainsWord(credits, credit)) return false;
+        }
+        catch { }
+        return current;
     }
 
     private static object ExtractInitialData(string html)
